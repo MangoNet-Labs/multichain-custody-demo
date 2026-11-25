@@ -1,0 +1,111 @@
+name: multichain-custody
+
+x-app: &app
+  image: multichain-custody-app:local
+  pull_policy: never
+x-env: &env
+  DATABASE_URL: postgresql://custody:${CUSTODY_DB_PASSWORD:?Run sh scripts/configure.sh first}@db:5432/custody
+x-after-migration: &after-migration
+  migrate: {condition: service_completed_successfully}
+
+services:
+  db:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: custody
+      POSTGRES_DB: custody
+      POSTGRES_PASSWORD: ${CUSTODY_DB_PASSWORD:?Run sh scripts/configure.sh first}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U custody -d custody"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    command: [custody-web, --migrate]
+    environment: *env
+    depends_on:
+      db: {condition: service_healthy}
+  unlock-init:
+    <<: *app
+    profiles: [setup]
+    command: [custody-signer, init-unlock]
+    environment:
+      CUSTODY_UNLOCK_FILE: /data/credentials/private/unlock.key
+    volumes: [unlock:/data/credentials]
+  web:
+    <<: *app
+    build: {context: ., target: app}
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      CUSTODY_CONTAINER_LISTEN: "1"
+    ports: ["127.0.0.1:${CUSTODY_WEB_PORT:-4310}:4310"]
+    restart: unless-stopped
+  bsc:
+    <<: *app
+    command: [evm-reader, --follow]
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      BSC_TESTNET_RPC_URL: ${BSC_TESTNET_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}
+      BSC_FETCH_CONCURRENCY: ${BSC_FETCH_CONCURRENCY:-4}
+      BSC_READY_CAPACITY: ${BSC_READY_CAPACITY:-8}
+    volumes:
+      - ${BSC_TOKEN_CONFIG:-./config/bsc-testnet-tokens.json}:/app/config/bsc-testnet-tokens.json:ro
+    restart: unless-stopped
+  mango:
+    build: {context: ., target: mango}
+    image: multichain-custody-mango:local
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      MANGO_REST_URL: ${MANGO_REST_URL:-https://fullnode.testnet2.mangonetwork.io/rest}
+      MANGO_FETCH_CONCURRENCY: ${MANGO_FETCH_CONCURRENCY:-2}
+      MANGO_INFLIGHT_MIB: ${MANGO_INFLIGHT_MIB:-64}
+      MANGO_READY_CAPACITY: ${MANGO_READY_CAPACITY:-8}
+    volumes:
+      - ${MANGO_COIN_CONFIG:-./config/mango-testnet-coins.json}:/app/config/mango-testnet-coins.json:ro
+    restart: unless-stopped
+  signer:
+    build: {context: ., target: signing}
+    image: multichain-custody-signing:local
+    command: [custody-signer, serve]
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      CUSTODY_KEYSTORE: /data/keystore/private
+      CUSTODY_UNLOCK_FILE: /data/credentials/private/unlock.key
+      BSC_TESTNET_RPC_URL: ${BSC_TESTNET_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}
+      BSC_MAX_PAYOUT_FEE_WEI: ${BSC_MAX_PAYOUT_FEE_WEI:-1000000000000000}
+      MANGO_RPC_URL: ${MANGO_RPC_URL:-https://fullnode.testnet2.mangonetwork.io}
+      MANGO_PAYOUT_GAS_BUDGET: ${MANGO_PAYOUT_GAS_BUDGET:-10000000}
+    volumes:
+      - keystore:/data/keystore
+      - unlock:/data/credentials:ro
+      - ${CUSTODY_SWEEP_CONFIG:-./config/sweep.example.toml}:/app/config/sweep.example.toml:ro
+    restart: unless-stopped
+  broadcast:
+    <<: *app
+    command: [evm-reader, --broadcast]
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      BSC_TESTNET_RPC_URL: ${BSC_TESTNET_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}
+    restart: unless-stopped
+  mango-broadcast:
+    image: multichain-custody-mango:local
+    pull_policy: never
+    command: [mango-worker, --broadcast]
+    depends_on: *after-migration
+    environment:
+      <<: *env
+      MANGO_RPC_URL: ${MANGO_RPC_URL:-https://fullnode.testnet2.mangonetwork.io}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  keystore:
+  unlock:

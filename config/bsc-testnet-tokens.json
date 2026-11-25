@@ -1,0 +1,10 @@
+{
+  "network": "bsc-testnet",
+  "tokens": [
+    {
+      "contract": "0xEdB22908ca8B42F0BbE0eC337F5F21948c83f046",
+      "symbol": "MGO",
+      "decimals": 9
+    }
+  ]
+}

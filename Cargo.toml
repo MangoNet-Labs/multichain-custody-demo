@@ -1,0 +1,10 @@
+[workspace]
+exclude = ["mango-worker"]
+members = ["crates/custody-core", "crates/evm-reader", "crates/custody-store", "crates/custody-signer", "crates/custody-web"]
+resolver = "2"
+
+[workspace.package]
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+publish = false

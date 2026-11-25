@@ -1,0 +1,23 @@
+# Signer reads these rules at startup. Amounts use display units, not raw units.
+# Trigger when confirmed address balance >= min_sweep_amount, before fees (display units).
+[[sweep]]
+network = "mango-testnet"
+asset = "0x2::mgo::MGO"
+min_sweep_amount = "1"
+
+# Optional Mango token: enable T in mango-testnet-coins.json first, then
+# copy its canonical type from Wallet > Coin type. Example only, not deployed:
+# [[sweep]]
+# network = "mango-testnet"
+# asset = "0x0000000000000000000000000000000000000000000000000000000000000abc::usd::USD"
+# min_sweep_amount = "10"
+
+[[sweep]]
+network = "bsc-testnet"
+asset = "native"
+min_sweep_amount = "0.01"
+
+[[sweep]]
+network = "bsc-testnet"
+asset = "0xEdB22908ca8B42F0BbE0eC337F5F21948c83f046"
+min_sweep_amount = "1"

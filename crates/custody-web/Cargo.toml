@@ -1,0 +1,23 @@
+[package]
+name = "custody-web"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy-primitives = "1"
+anyhow = "1"
+axum = "0.8"
+bs58 = "0.5"
+custody-core = { path = "../custody-core" }
+custody-store = { path = "../custody-store" }
+hex = "0.4"
+maud = "0.27"
+serde = { version = "1", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls","postgres","macros"] }
+tokio = { version = "1", features = ["macros","rt-multi-thread","net"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+
+[package]
+license = "MIT"
+name = "mango-worker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bcs = "0.1"
+base64 = "0.22"
+serde = {version="1",features=["derive"]}
+sha3 = "0.10"
+shared-crypto = { git = "https://github.com/MangoNet-Labs/mango.git", rev = "72b889a872d7c71e2dd9886f956fbc3cfff1789e" }
+sqlx = { version="0.8", default-features=false, features=["runtime-tokio-rustls","postgres","migrate","macros"] }
+custody-core = { path = "../crates/custody-core" }
+custody-store = { path = "../crates/custody-store" }
+mgo-types = { git = "https://github.com/MangoNet-Labs/mango.git", rev = "72b889a872d7c71e2dd9886f956fbc3cfff1789e" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls","json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros","rt-multi-thread","time","sync"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[dev-dependencies]
+axum = "0.6"
+url = "2"
+tempfile="3"
+sqlx = { version="0.8", default-features=false, features=["runtime-tokio-rustls","postgres","migrate","macros"] }

@@ -1,0 +1,17 @@
+**
+!LICENSE
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!config/
+!config/**
+!migrations/
+!migrations/**
+!mango-worker/
+mango-worker/**
+!mango-worker/Cargo.toml
+!mango-worker/Cargo.lock
+!mango-worker/src/
+!mango-worker/src/**
+!mango-worker/rust-toolchain.toml
