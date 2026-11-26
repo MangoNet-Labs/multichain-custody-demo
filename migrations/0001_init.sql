@@ -1,5 +1,5 @@
 -- PostgreSQL 17 / SQLx: initial public schema for a fresh demo installation.
--- Run via the Compose migrate service; subsequent releases add numbered migrations.
+-- Fresh installations only. SQLx verifies the baseline checksum on restart.
 
 -- 1. Accounts, assets and custody wallets
 -- ---------------------------------------
@@ -10,10 +10,11 @@ COMMENT ON DOMAIN demo_network IS 'The two supported testnets. The same symbol o
 CREATE DOMAIN digest32 AS BYTEA CHECK (octet_length(VALUE) = 32);
 COMMENT ON DOMAIN digest32 IS 'Raw 32-byte digest or Mango object ID; never store its display encoding here.';
 
-CREATE DOMAIN positive_raw AS NUMERIC CHECK (
-    VALUE > 0 AND scale(VALUE) = 0 AND
+CREATE DOMAIN nonnegative_raw AS NUMERIC CHECK (
+    VALUE >= 0 AND scale(VALUE) = 0 AND
     VALUE <= 115792089237316195423570985008687907853269984665640564039457584007913129639935
 );
+CREATE DOMAIN positive_raw AS nonnegative_raw CHECK (VALUE > 0);
 COMMENT ON DOMAIN positive_raw IS 'Positive integer amount in the smallest asset unit, up to uint256.';
 
 CREATE TABLE demo_users (
@@ -28,6 +29,7 @@ CREATE TABLE assets (
     symbol TEXT NOT NULL,
     decimals SMALLINT NOT NULL CHECK (decimals BETWEEN 0 AND 255),
     enabled_from BIGINT NOT NULL DEFAULT 0 CHECK (enabled_from >= 0),
+    opening_digest digest32,
     PRIMARY KEY (network, asset),
     CHECK (octet_length(asset) = 0 OR (network = 'bsc-testnet' AND octet_length(asset) = 20)
         OR (network = 'mango-testnet' AND octet_length(asset) BETWEEN 1 AND 512))
@@ -36,6 +38,14 @@ COMMENT ON TABLE assets IS 'Deposit allowlist, identified by network and contrac
 COMMENT ON COLUMN assets.asset IS 'Empty for native coins; raw BSC contract address or UTF-8 canonical Mango coin type for tokens.';
 COMMENT ON COLUMN assets.decimals IS 'Display precision. Persist and compare balances in raw integer units.';
 COMMENT ON COLUMN assets.enabled_from IS 'First height at which this asset is eligible for scanning.';
+
+COMMENT ON COLUMN assets.opening_digest IS 'Cursor digest immediately before a later listing; NULL for assets enabled at initialization.';
+
+CREATE TABLE asset_registries (
+    network demo_network PRIMARY KEY,
+    initialized BOOLEAN NOT NULL DEFAULT false
+);
+COMMENT ON TABLE asset_registries IS 'Whether this network has activated its initial asset list under the cursor lock.';
 
 CREATE TABLE custody_installation (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
@@ -71,6 +81,16 @@ COMMENT ON COLUMN wallets.key_ref IS 'Handle for the encrypted key in the signer
 CREATE UNIQUE INDEX user_deposit_wallet ON wallets(network,owner_id) WHERE role = 'deposit';
 CREATE UNIQUE INDEX platform_wallet ON wallets(network,role) WHERE role <> 'deposit';
 
+-- Track signed changes only for registered addresses. The token need not be
+-- listed yet, so there is intentionally no foreign key to assets.
+CREATE TABLE opening_balances (
+    network demo_network NOT NULL, asset BYTEA NOT NULL CHECK (octet_length(asset)>0),
+    address BYTEA NOT NULL, amount NUMERIC NOT NULL CHECK (scale(amount)=0),
+    PRIMARY KEY(network,asset,address),
+    FOREIGN KEY(network,address) REFERENCES wallets(network,address)
+);
+COMMENT ON TABLE opening_balances IS 'Pre-listing holdings; frozen at activation and never credited to a user.';
+
 -- 2. Confirmed chain data and scanner health
 -- ------------------------------------------
 
@@ -92,6 +112,7 @@ CREATE TABLE scanned_blocks (
     parent digest32 NOT NULL,
     evidence_hash digest32 NOT NULL,
     mango_execution_hash digest32,
+    opening_evidence digest32 NOT NULL,
     PRIMARY KEY (network,height),
     UNIQUE (network,digest)
 );
@@ -185,7 +206,7 @@ CREATE TABLE mango_internal_outputs (
     tx digest32 NOT NULL,
     sender BYTEA NOT NULL,
     recipient BYTEA NOT NULL,
-    amount positive_raw NOT NULL,
+    amount nonnegative_raw NOT NULL,
     order_ref TEXT NOT NULL,
     asset BYTEA NOT NULL DEFAULT '',
     PRIMARY KEY (network,tx,recipient,asset),
@@ -224,7 +245,8 @@ CREATE TABLE withdrawals (
     recipient BYTEA NOT NULL,
     amount positive_raw NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
-        ('queued','signed','submitted','completed','failed','review')),
+        ('queued','consolidating','signed','submitted','completed','failed','review')),
+    CHECK (status<>'consolidating' OR network='mango-testnet'),
     freeze_id BIGINT NOT NULL UNIQUE REFERENCES journal(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     detail TEXT,
@@ -249,6 +271,7 @@ COMMENT ON COLUMN sweep_rules.minimum IS 'Compare against gross balance before r
 CREATE TABLE sweep_checks (
     network demo_network NOT NULL, address BYTEA NOT NULL,
     revision BIGINT NOT NULL DEFAULT 1, next_check TIMESTAMPTZ DEFAULT now(),
+    finalized_failures SMALLINT NOT NULL DEFAULT 0 CHECK (finalized_failures BETWEEN 0 AND 4),
     lease UUID, lease_until TIMESTAMPTZ, detail TEXT NOT NULL DEFAULT 'checking confirmed balance',
     PRIMARY KEY(network,address), FOREIGN KEY(network,address) REFERENCES wallets(network,address),
     CHECK((lease IS NULL)=(lease_until IS NULL))
@@ -263,7 +286,7 @@ CREATE TABLE sweep_orders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(), network demo_network NOT NULL,
     deposit_address BYTEA NOT NULL, sender BYTEA NOT NULL, recipient BYTEA NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('sweep','gas_topup')),
-    trigger_asset BYTEA NOT NULL, asset BYTEA NOT NULL, amount positive_raw NOT NULL,
+    trigger_asset BYTEA NOT NULL, asset BYTEA NOT NULL, amount nonnegative_raw NOT NULL,
     minimum positive_raw NOT NULL, observed_balance positive_raw NOT NULL,
     observed_height BIGINT NOT NULL CHECK(observed_height>=0), observed_hash digest32 NOT NULL,
     status TEXT NOT NULL DEFAULT 'signed' CHECK(status IN ('signed','submitted','completed','failed','review')),
@@ -274,6 +297,7 @@ CREATE TABLE sweep_orders (
     FOREIGN KEY(network,asset) REFERENCES assets(network,asset),
     FOREIGN KEY(network,trigger_asset) REFERENCES assets(network,asset),
     CHECK(sender<>recipient AND observed_balance>=minimum),
+    CHECK(amount>0 OR (network='mango-testnet' AND kind='sweep')),
     CHECK((kind='sweep' AND deposit_address=sender AND asset=trigger_asset)
        OR (kind='gas_topup' AND deposit_address=recipient AND network='bsc-testnet' AND asset='' AND trigger_asset<>''))
 );
@@ -330,6 +354,7 @@ CREATE INDEX mango_coins_by_owner ON mango_wallet_coins(owner,asset,balance DESC
 
 CREATE TABLE mango_payouts (
     withdrawal_id UUID UNIQUE REFERENCES withdrawals(id),
+    merge_for UUID REFERENCES withdrawals(id),
     network demo_network NOT NULL DEFAULT 'mango-testnet' CHECK(network='mango-testnet'),
     sender BYTEA NOT NULL,
     digest digest32 NOT NULL UNIQUE,
@@ -346,9 +371,9 @@ CREATE TABLE mango_payouts (
     sweep_id UUID UNIQUE REFERENCES sweep_orders(id),
     sponsor BYTEA,
     sponsor_signature BYTEA,
-    payout_id UUID GENERATED ALWAYS AS (coalesce(withdrawal_id,sweep_id)) STORED PRIMARY KEY,
+    payout_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     CONSTRAINT mango_sponsor_role_fk FOREIGN KEY(network,sponsor) REFERENCES wallets(network,address),
-    CHECK (num_nonnulls(withdrawal_id,sweep_id)=1),
+    CHECK (num_nonnulls(withdrawal_id,sweep_id,merge_for)=1),
     CHECK ((sweep_id IS NOT NULL)=(sponsor IS NOT NULL) AND (sponsor IS NULL)=(sponsor_signature IS NULL)),
     CHECK (sponsor<>sender AND octet_length(sponsor_signature)=97 AND get_byte(sponsor_signature,0)=0),
     FOREIGN KEY(network,sender) REFERENCES wallets(network,address),
@@ -357,8 +382,11 @@ CREATE TABLE mango_payouts (
 COMMENT ON TABLE mango_payouts IS 'Durable Mango signed transactions shared by withdrawals and sponsored sweeps.';
 COMMENT ON COLUMN mango_payouts.sponsor IS 'Gas owner for sponsored sweeps; the sender pays gas for a normal withdrawal.';
 COMMENT ON COLUMN mango_payouts.net_gas IS 'Net Mango fee in raw units after the storage rebate; may be negative.';
+COMMENT ON COLUMN mango_payouts.merge_for IS 'Internal hot-wallet coin consolidation for this withdrawal; never posts principal.';
 
 CREATE INDEX mango_payout_sendable ON mango_payouts(next_send) WHERE confirmed_height IS NULL;
+CREATE UNIQUE INDEX mango_hot_one_inflight ON mango_payouts(sender) WHERE sponsor IS NULL AND confirmed_height IS NULL;
+CREATE INDEX mango_merge_history ON mango_payouts(merge_for) WHERE merge_for IS NOT NULL;
 
 CREATE TABLE mango_payout_inputs (
     object_id digest32 NOT NULL,
@@ -413,6 +441,7 @@ CREATE TABLE reconciliation_assets (
     run_id BIGINT NOT NULL REFERENCES reconciliation_runs, asset BYTEA NOT NULL,
     available NUMERIC NOT NULL, frozen NUMERIC NOT NULL, capital NUMERIC NOT NULL, net_fees NUMERIC NOT NULL,
     book_assets NUMERIC NOT NULL, observed NUMERIC NOT NULL,
+    opening NUMERIC NOT NULL,
     PRIMARY KEY(run_id,asset)
 );
 COMMENT ON TABLE reconciliation_assets IS 'Balances by asset for a reconciliation run: liabilities, capital, fees, and observed custody funds.';
@@ -439,8 +468,9 @@ INSERT INTO demo_users (id, display_name) VALUES
 
 INSERT INTO assets(network,asset,symbol,decimals) VALUES
     ('mango-testnet', '', 'MGO', 9),
-    ('bsc-testnet', '', 'BNB', 18),
-    ('bsc-testnet', decode('edb22908ca8b42f0bbe0ec337f5f21948c83f046','hex'), 'MGO', 9);
+    ('bsc-testnet', '', 'BNB', 18);
+
+INSERT INTO asset_registries(network) VALUES ('bsc-testnet'), ('mango-testnet');
 
 INSERT INTO custody_installation DEFAULT VALUES;
 

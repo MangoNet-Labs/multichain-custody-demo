@@ -12,6 +12,7 @@ pub struct Wallet {
 }
 #[derive(FromRow)]
 struct Asset {
+    opening: String,
     asset: Vec<u8>,
     available: String,
     frozen: String,
@@ -38,10 +39,14 @@ pub async fn snapshot(db: &PgPool, net: Network) -> Result<Snapshot> {
     let (height,d):(i64,Vec<u8>)=sqlx::query_as("SELECT c.height,c.digest::bytea FROM scan_cursors c JOIN scanned_blocks b USING(network,height,digest) WHERE network=$1")
         .bind(key).fetch_optional(&mut *tx).await?.context("no committed blocks for audit")?;
     let wallets:Vec<Wallet>=sqlx::query_as("WITH balances AS(SELECT address,asset,sum(delta) raw FROM custody_wallet_movements WHERE network=$1 AND height<=$2 GROUP BY address,asset)
-        SELECT w.address,a.asset,coalesce(b.raw,0)::text AS expected FROM wallets w JOIN assets a USING(network) LEFT JOIN balances b ON b.address=w.address AND b.asset=a.asset WHERE w.network=$1 ORDER BY w.address,a.asset")
+        SELECT w.address,a.asset,
+        (coalesce(b.raw,0)+coalesce(o.amount,0))::text AS expected FROM wallets w JOIN assets a USING(network)
+        LEFT JOIN opening_balances o ON (o.network,o.address,o.asset)=(w.network,w.address,a.asset)
+        LEFT JOIN balances b ON b.address=w.address AND b.asset=a.asset WHERE w.network=$1 ORDER BY w.address,a.asset")
         .bind(key).bind(height).fetch_all(&mut *tx).await?;
     ensure!(!wallets.is_empty(), "no registered custody wallets");
     let assets=sqlx::query_as("SELECT a.asset,
+        (SELECT coalesce(sum(o.amount),0)::text FROM opening_balances o WHERE o.asset=a.asset AND o.network=$1) AS opening,
         coalesce(sum(delta) FILTER(WHERE account LIKE 'user:%:available'),0)::text AS available,
         coalesce(sum(delta) FILTER(WHERE account LIKE 'user:%:frozen'),0)::text AS frozen,
         coalesce(sum(delta) FILTER(WHERE account='platform:capital'),0)::text AS capital,
@@ -142,23 +147,29 @@ async fn persist(
             .bind(id).bind(w.address).bind(w.asset).bind(w.expected).bind(raw).execute(&mut *tx).await?;
     }
     for a in s.assets {
-        sqlx::query("INSERT INTO reconciliation_assets SELECT $1,$2,$3::text::numeric,$4::text::numeric,$5::text::numeric,$6::text::numeric,$7::text::numeric,coalesce(sum(observed),0)
+        sqlx::query("INSERT INTO reconciliation_assets SELECT $1,$2,$3::text::numeric,$4::text::numeric,$5::text::numeric,$6::text::numeric,$7::text::numeric+$8::text::numeric,coalesce(sum(observed),0),$8::text::numeric
             FROM reconciliation_wallets WHERE run_id=$1 AND asset=$2")
-            .bind(id).bind(a.asset).bind(a.available).bind(a.frozen).bind(a.capital).bind(a.net_fees).bind(a.book_assets).execute(&mut *tx).await?;
+            .bind(id).bind(a.asset).bind(a.available).bind(a.frozen).bind(a.capital).bind(a.net_fees).bind(a.book_assets).bind(a.opening).execute(&mut *tx).await?;
     }
-    let matched:bool=sqlx::query_scalar("UPDATE reconciliation_runs SET matched=NOT EXISTS(SELECT 1 FROM reconciliation_wallets WHERE run_id=$1 AND expected<>observed)
-        AND NOT EXISTS(SELECT 1 FROM reconciliation_assets WHERE run_id=$1 AND (book_assets<>observed OR book_assets<>available+frozen+capital-net_fees)) WHERE id=$1 RETURNING matched")
+    let mismatch:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM reconciliation_wallets WHERE run_id=$1 AND expected<>observed)
+        OR EXISTS(SELECT 1 FROM reconciliation_assets WHERE run_id=$1 AND (book_assets<>observed OR book_assets<>available+frozen+capital-net_fees+opening))")
         .bind(id).fetch_one(&mut *tx).await?;
+    let matched = !mismatch;
+    sqlx::query("UPDATE reconciliation_runs SET matched=$2 WHERE id=$1")
+        .bind(id)
+        .bind(matched)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT paused FROM payment_control WHERE singleton FOR UPDATE")
         .fetch_one(&mut *tx)
         .await?;
     let latest:bool=sqlx::query_scalar("SELECT id=$2 FROM reconciliation_runs WHERE network=$1 ORDER BY height DESC,id DESC LIMIT 1").bind(net).bind(id).fetch_one(&mut *tx).await?;
-    if latest && !matched {
+    if latest && mismatch {
         sqlx::query("INSERT INTO reconciliation_holds VALUES($1,$2) ON CONFLICT(network) DO UPDATE SET run_id=excluded.run_id").bind(net).bind(id).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_control SET paused=true WHERE singleton")
             .execute(&mut *tx)
             .await?;
-    } else if latest {
+    } else if latest && matched {
         // A corrected audit removes the hold, but never resumes the operator's pause.
         sqlx::query("DELETE FROM reconciliation_holds WHERE network=$1")
             .bind(net)

@@ -4,6 +4,7 @@ pub mod mango;
 pub mod mango_coins;
 pub mod payouts;
 pub mod reconcile;
+pub mod registry;
 pub mod sweeps;
 pub mod wallets;
 pub mod withdrawals;
@@ -41,7 +42,15 @@ pub struct Receipt {
     pub log: Option<(i64, i64)>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OpeningDelta {
+    pub address: Vec<u8>,
+    pub asset: Vec<u8>,
+    pub delta: String,
+}
+
 pub struct FinalizedBlock {
+    pub openings: Vec<OpeningDelta>,
     pub network: Network,
     pub height: i64,
     pub digest: [u8; 32],
@@ -127,8 +136,7 @@ pub async fn apply(db: &PgPool, b: &FinalizedBlock) -> Result<Applied> {
     apply_with_rules(db, b, None).await
 }
 
-/// Additive changes take effect after the committed cursor. A worker that
-/// prefetched with an older allowlist cannot advance that cursor afterwards.
+/// Keep the original BSC evidence fingerprint for replay across upgrades.
 pub async fn configure_tokens(
     db: &PgPool,
     mut tokens: Vec<([u8; 20], String, u8)>,
@@ -139,30 +147,16 @@ pub async fn configure_tokens(
         "duplicate token"
     );
     let rules: [u8; 32] = Sha256::digest(serde_json::to_vec(&tokens)?).into();
-    let mut tx = db.begin().await?;
-    let height: i64 = sqlx::query_scalar(
-        "SELECT height FROM scan_cursors WHERE network='bsc-testnet' FOR UPDATE",
+    registry::activate(
+        db,
+        Network::BscTestnet,
+        tokens
+            .into_iter()
+            .map(|(id, s, d)| (id.to_vec(), s, d.into()))
+            .collect(),
+        |_| Ok(Some(rules)),
     )
-    .fetch_one(&mut *tx)
     .await?;
-    for (address, symbol, decimals) in &tokens {
-        sqlx::query("INSERT INTO assets(network,asset,symbol,decimals,enabled_from) VALUES('bsc-testnet',$1,$2,$3,$4) ON CONFLICT(network,asset) DO NOTHING")
-            .bind(address.as_slice()).bind(symbol).bind(i16::from(*decimals)).bind(height.checked_add(1).context("height overflow")?).execute(&mut *tx).await?;
-    }
-    let active:Vec<(Vec<u8>,String,i16)>=sqlx::query_as("SELECT asset,symbol,decimals FROM assets WHERE network='bsc-testnet' AND asset<>'' ORDER BY asset").fetch_all(&mut *tx).await?;
-    ensure!(
-        active.len() == tokens.len()
-            && active
-                .iter()
-                .zip(&tokens)
-                .all(|(a, t)| a.0 == t.0 && a.1 == t.1 && a.2 == i16::from(t.2)),
-        "cannot remove or redefine an existing token"
-    );
-    sqlx::query("UPDATE scan_cursors SET rules=$1 WHERE network='bsc-testnet'")
-        .bind(rules.as_slice())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
     Ok(rules)
 }
 
@@ -280,6 +274,9 @@ async fn apply_all(
     };
     addresses.dedup();
     let evidence: [u8; 32] = evidence.finalize().into();
+    let mut opening_hash = Sha256::new();
+    serde_json::to_writer(&mut opening_hash, &b.openings)?;
+    let opening_hash: [u8; 32] = opening_hash.finalize().into();
     let mut tx = db.begin().await?;
     let (last, digest, current_rules): (i64, Vec<u8>, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT height,digest::bytea,rules::bytea FROM scan_cursors WHERE network=$1 FOR UPDATE",
@@ -309,9 +306,9 @@ async fn apply_all(
         }
     }
     if b.height <= last {
-        let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM scanned_blocks WHERE network=$1 AND height=$2 AND digest=$3 AND parent=$4 AND evidence_hash=$5 AND (mango_execution_hash IS NULL OR mango_execution_hash=$6))")
+        let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM scanned_blocks WHERE network=$1 AND height=$2 AND digest=$3 AND parent=$4 AND evidence_hash=$5 AND (mango_execution_hash IS NULL OR mango_execution_hash=$6) AND opening_evidence=$7)")
             .bind(net).bind(b.height).bind(b.digest.as_slice()).bind(b.parent.as_slice()).bind(evidence.as_slice())
-            .bind(&mango_hash)
+            .bind(&mango_hash).bind(opening_hash.as_slice())
             .fetch_one(&mut *tx).await?;
         ensure!(
             same,
@@ -324,8 +321,21 @@ async fn apply_all(
         last.checked_add(1) == Some(b.height) && digest == b.parent,
         "non-contiguous height or parent digest"
     );
-    sqlx::query("INSERT INTO scanned_blocks(network,height,digest,parent,evidence_hash,mango_execution_hash) VALUES($1,$2,$3,$4,$5,$6)")
-        .bind(net).bind(b.height).bind(b.digest.as_slice()).bind(b.parent.as_slice()).bind(evidence.as_slice()).bind(mango_hash).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO scanned_blocks(network,height,digest,parent,evidence_hash,mango_execution_hash,opening_evidence) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        .bind(net).bind(b.height).bind(b.digest.as_slice()).bind(b.parent.as_slice()).bind(evidence.as_slice()).bind(mango_hash).bind(opening_hash.as_slice()).execute(&mut *tx).await?;
+    if !b.openings.is_empty() {
+        let owners: Vec<_> = b.openings.iter().map(|d| d.address.as_slice()).collect();
+        let assets: Vec<_> = b.openings.iter().map(|d| d.asset.as_slice()).collect();
+        let amounts: Vec<_> = b.openings.iter().map(|d| d.delta.as_str()).collect();
+        sqlx::query("INSERT INTO opening_balances(network,address,asset,amount)
+            SELECT $1,x.address,x.asset,sum(x.delta::numeric)
+            FROM unnest($2::bytea[],$3::bytea[],$4::text[]) x(address,asset,delta)
+            JOIN wallets w ON w.network=$1 AND w.address=x.address
+            WHERE NOT EXISTS(SELECT 1 FROM assets a WHERE a.network=$1 AND a.asset=x.asset)
+            GROUP BY x.address,x.asset HAVING sum(x.delta::numeric)<>0
+            ON CONFLICT(network,asset,address) DO UPDATE SET amount=opening_balances.amount+excluded.amount")
+            .bind(net).bind(owners).bind(assets).bind(amounts).execute(&mut *tx).await?;
+    }
     let wallets: HashMap<Vec<u8>, Option<String>> = sqlx::query_as::<_, (Vec<u8>, Option<String>)>(
         "SELECT address,owner_id FROM wallets WHERE network=$1 AND address=ANY($2::bytea[])",
     )
@@ -396,7 +406,9 @@ async fn apply_all(
     }
     if !dirty.is_empty() {
         sqlx::query("INSERT INTO sweep_checks(network,address) SELECT $1,x FROM unnest($2::bytea[]) x
-          ON CONFLICT(network,address) DO UPDATE SET revision=sweep_checks.revision+1,next_check=now()")
+          ON CONFLICT(network,address) DO UPDATE SET revision=sweep_checks.revision+1,
+          next_check=CASE WHEN sweep_checks.finalized_failures>0 THEN greatest(sweep_checks.next_check,now()) ELSE now() END
+          WHERE sweep_checks.finalized_failures<4")
           .bind(net).bind(dirty.into_iter().collect::<Vec<_>>()).execute(&mut *tx).await?;
     }
     if let Some(items) = mango {

@@ -59,6 +59,7 @@ pub struct Entry {
     pub address: Option<Vec<u8>>,
     pub tx: Option<Vec<u8>>,
     pub confirmed_tx: Option<Vec<u8>>,
+    pub merge_tx: Option<Vec<u8>>,
     pub height: Option<i64>,
     pub id: String,
     pub status: String,
@@ -75,17 +76,21 @@ pub async fn history(
         "SELECT d.network::text AS net,a.symbol,a.decimals,j.amount::text,
          CASE WHEN d.network='mango-testnet' AND d.asset<>'' THEN convert_from(d.asset,'UTF8') END AS coin_type,
          d.sender AS address,d.tx::bytea,d.height,d.journal_id::text AS id,
-         'credited'::text AS status,NULL::text AS detail,NULL::text AS gas,NULL::bytea AS confirmed_tx
+         'credited'::text AS status,NULL::text AS detail,NULL::text AS gas,NULL::bytea AS confirmed_tx,NULL::bytea AS merge_tx
          FROM deposits d JOIN journal j ON j.id=d.journal_id JOIN assets a ON (a.network,a.asset)=(d.network,d.asset)
          JOIN wallets w ON w.network=d.network AND w.address=d.recipient
          WHERE w.owner_id=$1 ORDER BY d.journal_id DESC LIMIT $2 OFFSET $3"
     } else {
         "SELECT w.network::text AS net,a.symbol,a.decimals,w.amount::text,CASE WHEN w.network='mango-testnet' AND w.asset<>'' THEN convert_from(w.asset,'UTF8') END AS coin_type,
          w.recipient AS address,coalesce(p.digest,m.digest)::bytea AS tx,coalesce(p.confirmed_height,m.confirmed_height) AS height,
-         w.id::text,w.status,w.detail,coalesce(m.net_gas::text,g.amount::text) AS gas,coalesce(p.observed_tx,m.observed_tx)::bytea AS confirmed_tx
+         w.id::text,w.status,w.detail,CASE WHEN m.net_gas IS NOT NULL OR prep.fees IS NOT NULL
+         THEN (coalesce(m.net_gas,0)+coalesce(prep.fees,0))::text ELSE g.amount::text END AS gas,
+         coalesce(p.observed_tx,m.observed_tx)::bytea AS confirmed_tx,prep.digest::bytea AS merge_tx
          FROM withdrawals w JOIN assets a ON (a.network,a.asset)=(w.network,w.asset)
          LEFT JOIN evm_payouts p ON p.withdrawal_id=w.id LEFT JOIN journal g ON g.id=p.gas_journal
          LEFT JOIN mango_payouts m ON m.withdrawal_id=w.id
+         LEFT JOIN LATERAL (SELECT digest,sum(net_gas) OVER () AS fees FROM mango_payouts
+           WHERE merge_for=w.id ORDER BY confirmed_height DESC NULLS FIRST LIMIT 1) prep ON true
          WHERE w.user_id=$1 ORDER BY w.created_at DESC,w.id DESC LIMIT $2 OFFSET $3"
     };
     sqlx::query_as(query)
@@ -102,6 +107,7 @@ pub struct PlatformWallet {
     pub address: Vec<u8>,
 }
 pub struct Operations {
+    pub openings: Vec<Opening>,
     pub paused: bool,
     pub cursors: Vec<Scan>,
     pub wallets: Vec<PlatformWallet>,
@@ -112,7 +118,18 @@ pub struct Operations {
     pub observed: Vec<Observed>,
 }
 #[derive(FromRow)]
+pub struct Opening {
+    pub net: String,
+    pub address: Vec<u8>,
+    pub asset: Vec<u8>,
+    pub symbol: String,
+    pub decimals: i16,
+    pub height: i64,
+    pub amount: String,
+}
+#[derive(FromRow)]
 pub struct Audit {
+    pub opening: String,
     pub coin_type: Option<String>,
     pub net: String,
     pub height: i64,
@@ -167,6 +184,9 @@ pub struct Scan {
 }
 pub async fn operations(db: &PgPool) -> sqlx::Result<Operations> {
     Ok(Operations{
+        openings:sqlx::query_as("SELECT o.network::text net,o.address,a.asset,a.symbol,a.decimals,a.enabled_from-1 AS height,o.amount::text
+          FROM opening_balances o JOIN assets a USING(network,asset) WHERE a.opening_digest IS NOT NULL AND o.amount<>0
+          ORDER BY a.enabled_from DESC,o.network,a.asset,o.address LIMIT 64").fetch_all(db).await?,
         paused:sqlx::query_scalar("SELECT paused FROM payment_control WHERE singleton").fetch_one(db).await?,
         cursors:sqlx::query_as("SELECT n.network::text AS net,c.height,c.digest::bytea,s.head,
             CASE WHEN s.head IS NOT NULL THEN greatest(s.head-c.height,0) END AS lag,
@@ -186,7 +206,7 @@ pub async fn operations(db: &PgPool) -> sqlx::Result<Operations> {
             LEFT JOIN mango_payouts m ON m.sweep_id=s.id ORDER BY s.created_at DESC,s.id DESC LIMIT 20").fetch_all(db).await?,
         checks:sqlx::query_as("SELECT network::text,address,detail FROM sweep_checks ORDER BY next_check NULLS LAST,address LIMIT 20").fetch_all(db).await?,
         audits:sqlx::query_as("WITH latest AS(SELECT DISTINCT ON(network) * FROM reconciliation_runs ORDER BY network,height DESC,id DESC)
-          SELECT r.network::text net,r.height,r.matched,a.symbol,a.decimals,x.available::text,x.frozen::text,x.capital::text,x.net_fees::text fees,x.book_assets::text book,x.observed::text,
+          SELECT r.network::text net,r.height,(x.book_assets=x.observed AND x.book_assets=x.available+x.frozen+x.capital-x.net_fees+x.opening AND NOT EXISTS(SELECT 1 FROM reconciliation_wallets v WHERE v.run_id=r.id AND v.asset=x.asset AND v.expected<>v.observed)) AS matched,x.opening::text,a.symbol,a.decimals,x.available::text,x.frozen::text,x.capital::text,x.net_fees::text fees,x.book_assets::text book,x.observed::text,
           CASE WHEN a.network='mango-testnet' AND a.asset<>'' THEN convert_from(a.asset,'UTF8') END coin_type
           FROM latest r JOIN reconciliation_assets x ON x.run_id=r.id JOIN assets a ON a.network=r.network AND a.asset=x.asset ORDER BY r.network,a.asset").fetch_all(db).await?,
         observed:sqlx::query_as("WITH latest AS(SELECT DISTINCT ON(network) * FROM reconciliation_runs ORDER BY network,height DESC,id DESC)

@@ -24,6 +24,25 @@ const PAYOUT: B256 = B256::new([22; 32]);
 const CANON: B256 = B256::new([11; 32]);
 const FORK: B256 = B256::new([99; 32]);
 
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "run sh scripts/test-postgres.sh"]
+async fn replay_uses_registry_at_target_height(db: PgPool) -> Result<()> {
+    initialize(
+        &db,
+        BscTestnet,
+        Cursor {
+            height: 10,
+            digest: [10; 32],
+        },
+    )
+    .await?;
+    configure_tokens(&db, vec![]).await?;
+    configure_tokens(&db, vec![([7; 20], "TEST".into(), 9)]).await?;
+    assert!(crate::historical_tokens(&db, 10).await?.is_empty());
+    assert_eq!(crate::historical_tokens(&db, 11).await?.len(), 1);
+    Ok(())
+}
+
 fn block(hash: B256) -> Value {
     let tx = |i, id, from, to, value| {
         json!({"transactionIndex":i, "hash":id, "from":from, "to":to,
@@ -118,6 +137,7 @@ async fn outage_and_unfinalized_fork_cannot_credit_or_settle(db: PgPool) -> Resu
     custody_store::apply(
         &db,
         &FinalizedBlock {
+            openings: vec![],
             network: BscTestnet,
             height: 10,
             digest: [10; 32],

@@ -77,13 +77,14 @@ struct Coin {
     balance: String,
     coin_type: String,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Page {
     data: Vec<Coin>,
-    next_cursor: Option<ObjectID>,
     has_next_page: bool,
 }
+const HOT_PAGE_SIZE: usize = 50;
 const MAX_INPUTS: usize = 128;
 fn build(
     sender: MgoAddress,
@@ -111,15 +112,17 @@ fn build(
         budget,
         price,
     )?;
-    encoded(&tx, coins)
+    encoded(&tx, coins, amount, false)
 }
-fn encoded(tx: &TransactionData, coins: &[ObjectRef]) -> Result<Quote> {
+fn encoded(tx: &TransactionData, coins: &[ObjectRef], amount: u64, merge: bool) -> Result<Quote> {
     let intent = Keccak256::digest(bcs::to_bytes(&IntentMessage::new(
         Intent::mgo_transaction(),
         tx,
     ))?)
     .into();
     Ok(Quote::Ready {
+        merge,
+        amount,
         gas_count: tx.gas_data().payment.len(),
         bytes: bcs::to_bytes(tx)?,
         digest: default_hash(tx),
@@ -193,7 +196,46 @@ fn build_token(
         vec![first, qty, dest],
     );
     let tx = TransactionData::new_programmable(sender, gas.to_vec(), pt.finish(), budget, price);
-    encoded(&tx, &[coins, gas].concat())
+    encoded(&tx, &[coins, gas].concat(), amount, false)
+}
+
+fn build_merge(
+    sender: MgoAddress,
+    amount: u64,
+    budget: u64,
+    price: u64,
+    coins: &[ObjectRef],
+    gas: &[ObjectRef],
+) -> Result<Quote> {
+    ensure!(
+        budget > 0
+            && price > 0
+            && amount > 0
+            && !gas.is_empty()
+            && coins.len() + gas.len() <= MAX_INPUTS,
+        "invalid merge inputs or budget"
+    );
+    let mut ids = HashSet::new();
+    ensure!(
+        coins.iter().chain(gas).all(|r| ids.insert(r.0)),
+        "duplicate merge input"
+    );
+    let tx = if coins.is_empty() {
+        ensure!(gas.len() >= 2, "native merge needs two coins");
+        // The protocol combines the gas payments; the surviving coin stays with hot.
+        TransactionData::new_pay_all_mgo(sender, gas[1..].to_vec(), sender, gas[0], budget, price)
+    } else {
+        ensure!(coins.len() >= 2, "token merge needs two coins");
+        let mut pt = ProgrammableTransactionBuilder::new();
+        let first = pt.obj(ObjectArg::ImmOrOwnedObject(coins[0]))?;
+        let rest = coins[1..]
+            .iter()
+            .map(|c| pt.obj(ObjectArg::ImmOrOwnedObject(*c)))
+            .collect::<Result<Vec<_>>>()?;
+        pt.command(Command::MergeCoins(first, rest));
+        TransactionData::new_programmable(sender, gas.to_vec(), pt.finish(), budget, price)
+    };
+    encoded(&tx, &[coins, gas].concat(), amount, true)
 }
 
 fn verify_gain(dry: &Value, recipient: MgoAddress, asset: &str, amount: u64) -> Result<()> {
@@ -222,68 +264,78 @@ fn verify_gain(dry: &Value, recipient: MgoAddress, asset: &str, amount: u64) -> 
         );
     }
     ensure!(
-        received == Some(amount),
+        received.unwrap_or_default() == amount,
         "dry-run recipient gain differs from order"
     );
     Ok(())
 }
 
-async fn select_inputs(
+enum Selection {
+    Enough(Vec<ObjectRef>),
+    Merge(Vec<ObjectRef>),
+    Short,
+}
+
+async fn first_page_inputs(
     node: &Node,
     sender: MgoAddress,
     asset: &str,
     required: u64,
-    max: usize,
-) -> Result<Option<Vec<ObjectRef>>> {
+    merge_gas: u64,
+) -> Result<Selection> {
     let tag = parse_mgo_type_tag(asset)?;
-    let mut best = Vec::new();
-    let mut cursor = None::<ObjectID>;
+    let page: Page = node
+        .call("mgox_getCoins", json!([sender, asset, null, HOT_PAGE_SIZE]))
+        .await?;
+    ensure!(
+        page.data.len() <= HOT_PAGE_SIZE,
+        "oversized Mango coin page"
+    );
+    let mut best = Vec::with_capacity(page.data.len());
     let mut seen = HashSet::new();
-    let mut pages = HashSet::new();
-    loop {
-        let page: Page = node
-            .call("mgox_getCoins", json!([sender, asset, cursor, 50]))
-            .await?;
-        for c in page.data {
-            ensure!(
-                parse_mgo_type_tag(&c.coin_type)? == tag,
-                "wrong Mango coin type"
-            );
-            ensure!(
-                seen.insert(c.coin_object_id),
-                "duplicate Mango coin in pagination"
-            );
-            let balance = c.balance.parse::<u64>()?;
-            if balance > 0 {
-                best.push((
-                    balance,
-                    (
-                        c.coin_object_id,
-                        SequenceNumber::from_u64(c.version.parse()?),
-                        c.digest,
-                    ),
-                ));
-            }
-        }
-        best.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
-        best.truncate(max);
-        let mut total = 0u128;
-        let count = best.iter().position(|(b, _)| {
-            total += u128::from(*b);
-            total >= u128::from(required)
-        });
-        if let Some(last) = count {
-            best.truncate(last + 1);
-            break;
-        }
-        if !page.has_next_page {
-            return Ok(None);
-        }
-        let next = page.next_cursor.context("missing next coin cursor")?;
-        ensure!(pages.insert(next), "repeated Mango coin cursor");
-        cursor = Some(next);
+    for c in page.data {
+        ensure!(
+            parse_mgo_type_tag(&c.coin_type)? == tag && seen.insert(c.coin_object_id),
+            "unexpected Mango coin type or duplicate coin"
+        );
+        best.push((
+            c.balance.parse::<u64>()?,
+            (
+                c.coin_object_id,
+                SequenceNumber::from_u64(c.version.parse()?),
+                c.digest,
+            ),
+        ));
     }
-    Ok(Some(best.into_iter().map(|(_, r)| r).collect()))
+    best.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    let mut total = 0u128;
+    if let Some(last) = best.iter().position(|(b, _)| {
+        total += u128::from(*b);
+        total >= u128::from(required)
+    }) {
+        return Ok(Selection::Enough(
+            best.into_iter().take(last + 1).map(|(_, r)| r).collect(),
+        ));
+    }
+    if !page.has_next_page || best.len() < 2 || total < u128::from(merge_gas) {
+        return Ok(Selection::Short);
+    }
+    // Check solvency in one call; never traverse the remaining coin objects.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Balance {
+        coin_type: String,
+        total_balance: String,
+    }
+    let balance: Balance = node.call("mgox_getBalance", json!([sender, asset])).await?;
+    ensure!(
+        parse_mgo_type_tag(&balance.coin_type)? == tag,
+        "wrong Mango balance type"
+    );
+    if balance.total_balance.parse::<u128>()? < u128::from(required) {
+        return Ok(Selection::Short);
+    }
+    Ok(Selection::Merge(best.into_iter().map(|(_, r)| r).collect()))
 }
 
 async fn quote(
@@ -303,42 +355,43 @@ async fn quote(
     } else {
         budget
     };
-    let Some(gas) = select_inputs(
-        node,
-        sender,
-        MGO,
-        required,
-        if native { MAX_INPUTS } else { MAX_INPUTS - 1 },
-    )
-    .await?
-    else {
-        return Ok(Quote::Waiting(
-            "waiting for spendable hot wallet MGO for payment or gas".into(),
-        ));
+    let (gas, mut merge) = match first_page_inputs(node, sender, MGO, required, budget).await? {
+        Selection::Enough(gas) => (gas, false),
+        Selection::Merge(gas) => (gas, true),
+        Selection::Short => {
+            return Ok(Quote::Waiting(
+                "waiting for spendable hot wallet MGO for payment or gas".into(),
+            ))
+        }
+    };
+    let coins = if native {
+        vec![]
+    } else {
+        match first_page_inputs(node, sender, asset, amount, 0).await? {
+            Selection::Enough(coins) => coins,
+            Selection::Merge(coins) => {
+                merge = true;
+                coins
+            }
+            Selection::Short => {
+                return Ok(Quote::Waiting(
+                    "waiting for spendable hot wallet token balance".into(),
+                ))
+            }
+        }
     };
     let price: String = node.call("mgox_getReferenceGasPrice", json!([])).await?;
-    let q = if native {
-        build(sender, recipient, amount, budget, price.parse()?, &gas)?
+    let price = price.parse()?;
+    let q = if merge {
+        build_merge(sender, amount, budget, price, &coins, &gas)?
+    } else if native {
+        build(sender, recipient, amount, budget, price, &gas)?
     } else {
-        let Some(coins) =
-            select_inputs(node, sender, asset, amount, MAX_INPUTS - gas.len()).await?
-        else {
-            return Ok(Quote::Waiting(
-                "waiting for spendable hot wallet token balance".into(),
-            ));
-        };
         build_token(
-            sender,
-            recipient,
-            amount,
-            budget,
-            price.parse()?,
-            asset,
-            &coins,
-            &gas,
+            sender, recipient, amount, budget, price, asset, &coins, &gas,
         )?
     };
-    if let Quote::Ready { bytes, .. } = &q {
+    if let Quote::Ready { bytes, merge, .. } = &q {
         let dry: Value = node
             .call(
                 "mgo_dryRunTransactionBlock",
@@ -350,7 +403,7 @@ async fn quote(
                 "Mango dry-run failed; check gas budget and coin liquidity".into(),
             ));
         }
-        if !native {
+        if !native && !merge {
             verify_gain(&dry, recipient, asset, amount)?;
         }
     }
@@ -384,6 +437,8 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
     }
     #[derive(sqlx::FromRow)]
     struct Signed {
+        order_id: String,
+        merge: bool,
         asset: String,
         id: String,
         digest: Vec<u8>,
@@ -396,10 +451,12 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
         sponsor: Option<Vec<u8>>,
         sponsor_signature: Option<Vec<u8>>,
     }
-    let row:Option<Signed>=sqlx::query_as("SELECT p.payout_id::text AS id,p.digest::bytea,p.tx_bytes,p.signature,p.sender,p.sponsor,p.sponsor_signature,convert_from(coalesce(s.asset,w.asset),'UTF8') AS asset,coalesce(s.recipient,w.recipient) AS recipient,coalesce(s.amount,w.amount)::text AS amount,p.budget::text FROM mango_payouts p LEFT JOIN withdrawals w ON w.id=p.withdrawal_id LEFT JOIN sweep_orders s ON s.id=p.sweep_id
-        WHERE coalesce(s.status,w.status) IN ('signed','submitted') AND p.confirmed_height IS NULL AND p.next_send<=now() ORDER BY p.next_send,p.payout_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED")
+    let row:Option<Signed>=sqlx::query_as("SELECT p.payout_id::text AS id,coalesce(w.id,s.id)::text AS order_id,p.merge_for IS NOT NULL AS merge,p.digest::bytea,p.tx_bytes,p.signature,p.sender,p.sponsor,p.sponsor_signature,convert_from(coalesce(s.asset,w.asset),'UTF8') AS asset,coalesce(s.recipient,w.recipient) AS recipient,coalesce(s.amount,w.amount)::text AS amount,p.budget::text FROM mango_payouts p LEFT JOIN withdrawals w ON w.id=coalesce(p.withdrawal_id,p.merge_for) LEFT JOIN sweep_orders s ON s.id=p.sweep_id
+        WHERE coalesce(s.status,w.status) IN ('signed','submitted','consolidating') AND p.confirmed_height IS NULL AND p.next_send<=now() ORDER BY p.next_send,p.payout_id LIMIT 1 FOR UPDATE OF p SKIP LOCKED")
         .fetch_optional(&mut *lock).await?;
     let Some(Signed {
+        order_id,
+        merge,
         asset,
         id,
         digest: hash,
@@ -421,7 +478,7 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
         "stored Mango transaction digest mismatch"
     );
     let sender = MgoAddress::from_bytes(&sender)?;
-    let order = if sponsor.is_some() || !asset.is_empty() {
+    let order = if merge || sponsor.is_some() || !asset.is_empty() {
         let rows:Vec<(Vec<u8>,i64,Vec<u8>,bool)>=sqlx::query_as("SELECT object_id::bytea,version,object_digest::bytea,is_gas FROM mango_payout_inputs WHERE payout_id=$1::text::uuid AND input_index IS NOT NULL AND reserved ORDER BY input_index")
             .bind(&id).fetch_all(&mut *lock).await?;
         let mut coins = vec![];
@@ -438,7 +495,20 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
                 coins.push(i)
             }
         }
-        if let Some(gas_owner) = &sponsor {
+        if merge {
+            ensure!(
+                sponsor.is_none() && (coins.is_empty() || !asset.is_empty()),
+                "invalid hot-wallet merge"
+            );
+            build_merge(
+                sender,
+                amount.parse()?,
+                budget.parse()?,
+                tx.gas_price(),
+                &coins.iter().map(sponsored::as_ref).collect::<Vec<_>>(),
+                &gas.iter().map(sponsored::as_ref).collect::<Vec<_>>(),
+            )?
+        } else if let Some(gas_owner) = &sponsor {
             sponsored::build(
                 &custody_store::mango::SponsoredSweep {
                     asset,
@@ -446,10 +516,11 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
                     recipient: recipient.as_slice().try_into()?,
                     sponsor: gas_owner.as_slice().try_into()?,
                     budget: budget.parse()?,
-                    amount: amount.parse()?,
-                    coins,
+                    max_amount: amount.parse()?,
                     gas,
                 },
+                &coins,
+                amount.parse()?,
                 tx.gas_price(),
             )?
         } else {
@@ -538,8 +609,10 @@ pub async fn broadcast(db: &PgPool, node: &Node) -> Result<bool> {
     } else {
         "withdrawals"
     };
-    sqlx::query(&format!("UPDATE {table} SET status=CASE WHEN $2 THEN 'submitted' ELSE status END,detail=$3 WHERE id=$1::text::uuid AND status IN ('signed','submitted')"))
-        .bind(id).bind(matched).bind(detail).execute(db).await?;
+    if !merge {
+        sqlx::query(&format!("UPDATE {table} SET status=CASE WHEN $2 THEN 'submitted' ELSE status END,detail=$3 WHERE id=$1::text::uuid AND status IN ('signed','submitted')"))
+            .bind(order_id).bind(matched).bind(detail).execute(db).await?;
+    }
     resp?;
     ensure!(matched, "Mango broadcast digest mismatch");
     Ok(true)

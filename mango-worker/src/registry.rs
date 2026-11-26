@@ -1,14 +1,9 @@
-use super::{reconcile, Node};
-use anyhow::{ensure, Context, Result};
-use custody_store::{reconcile::MangoInventory, Cursor, PgPool};
+use anyhow::{Context, Result};
+use custody_core::Network::MangoTestnet;
+use custody_store::{registry, PgPool};
 use mango_worker::rules::{Rules, Token};
 use sqlx::{PgConnection, Row};
-use std::{
-    collections::{BTreeMap, HashSet},
-    env,
-    num::NonZeroUsize,
-    path::PathBuf,
-};
+use std::{env, path::PathBuf};
 #[cfg(test)]
 mod tests;
 
@@ -54,98 +49,56 @@ pub async fn stored(db: &PgPool) -> Result<Rules> {
     rows(&mut *db.acquire().await?).await
 }
 
-async fn locked_anchor(conn: &mut PgConnection) -> Result<(Cursor, Option<Vec<u8>>)> {
-    let (height,digest,stamp):(i64,Vec<u8>,Option<Vec<u8>>)=sqlx::query_as(
-        "SELECT height,digest::bytea,rules::bytea FROM scan_cursors WHERE network='mango-testnet' FOR UPDATE")
-        .fetch_one(conn).await?;
-    Ok((
-        Cursor {
-            height,
-            digest: digest.as_slice().try_into()?,
-        },
-        stamp,
-    ))
-}
-async fn managed_owners(conn: &mut PgConnection) -> Result<HashSet<[u8; 32]>> {
-    Ok(sqlx::query_scalar::<_, Vec<u8>>(
-        "SELECT address FROM wallets WHERE network='mango-testnet'",
+pub async fn validate_config(db: &PgPool, wanted: &Rules) -> Result<()> {
+    registry::validate_config(
+        db,
+        MangoTestnet,
+        wanted
+            .entries()
+            .map(|(t, _)| {
+                (
+                    t.coin_type.as_bytes().to_vec(),
+                    t.symbol.clone(),
+                    t.decimals.into(),
+                )
+            })
+            .collect(),
     )
-    .fetch_all(conn)
-    .await?
-    .iter()
-    .map(|v| v.as_slice().try_into())
-    .collect::<Result<_, _>>()?)
+    .await
 }
 
-pub async fn activate(
-    db: &PgPool,
-    node: &Node,
-    limits: (NonZeroUsize, NonZeroUsize),
-    wanted: &Rules,
-) -> Result<Rules> {
-    let mut tx = db.begin().await?;
-    let (anchor, stamp) = locked_anchor(&mut tx).await?;
-    let known = rows(&mut tx).await?;
-    ensure!(
-        stamp == known.fingerprint().map(|h| h.to_vec()),
-        "Mango asset registry fingerprint mismatch"
-    );
-    let mut added: BTreeMap<_, _> = wanted
-        .entries()
-        .map(|(t, _)| (t.coin_type.as_str(), t))
-        .collect();
-    for (t, _) in known.entries() {
-        ensure!(
-            added.remove(t.coin_type.as_str()) == Some(t),
-            "cannot remove or redefine an enabled Mango coin"
-        );
-    }
-    if added.is_empty() {
-        tx.commit().await?;
-        return Ok(known);
-    }
-    let from = anchor
-        .height
-        .checked_add(1)
-        .context("checkpoint overflow")?;
-    let owners = managed_owners(&mut tx).await?;
-    if !owners.is_empty() {
-        let first:Option<(i64,Vec<u8>)>=sqlx::query_as("SELECT height,parent::bytea FROM scanned_blocks WHERE network='mango-testnet' ORDER BY height LIMIT 1").fetch_optional(&mut *tx).await?;
-        if let Some((first, parent)) = first {
-            // Never hold a SQL transaction across a historical REST replay.
-            // Both address issuance and block commits take the cursor lock.
-            tx.commit().await?;
-            let check = node.with_rules(Rules::new(added.values().map(|t| ((*t).clone(), 0)))?);
-            let mut inventory = MangoInventory::new();
-            reconcile::replay(
-                &check,
-                limits,
-                Cursor {
-                    height: first - 1,
-                    digest: parent.as_slice().try_into()?,
-                },
-                anchor,
-                &owners,
-                &mut inventory,
-            )
-            .await
-            .context("checking opening Mango token inventory")?;
-            ensure!(inventory.values().all(|(_,asset,raw)|asset.is_empty() || *raw==0),
-                "cannot enable Mango token with a nonzero opening balance in a managed wallet; no historical deposits were credited");
-            tx = db.begin().await?;
-            ensure!(locked_anchor(&mut tx).await?==(anchor,stamp) && managed_owners(&mut tx).await?==owners,
-                "Mango cursor, rules or managed wallets changed during opening check; restart activation");
-        }
-    }
-    for t in added.values() {
-        sqlx::query("INSERT INTO assets(network,asset,symbol,decimals,enabled_from) VALUES('mango-testnet',$1,$2,$3,$4)")
-            .bind(t.coin_type.as_bytes()).bind(&t.symbol).bind(i16::from(t.decimals)).bind(from).execute(&mut *tx).await?;
-    }
-    let active = rows(&mut tx).await?;
-    sqlx::query("UPDATE scan_cursors SET rules=$1 WHERE network='mango-testnet'")
-        .bind(active.fingerprint().map(|h| h.to_vec()))
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(active)
+pub async fn activate(db: &PgPool, wanted: &Rules) -> Result<Rules> {
+    let to_rules = |rows: &[(Vec<u8>, String, i16, i64)]| {
+        Rules::new(
+            rows.iter()
+                .map(|(id, s, d, h)| {
+                    Ok((
+                        Token {
+                            coin_type: String::from_utf8(id.clone())?,
+                            symbol: s.clone(),
+                            decimals: (*d).try_into()?,
+                        },
+                        *h,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+    let rows = registry::activate(
+        db,
+        MangoTestnet,
+        wanted
+            .entries()
+            .map(|(t, _)| {
+                (
+                    t.coin_type.as_bytes().to_vec(),
+                    t.symbol.clone(),
+                    t.decimals.into(),
+                )
+            })
+            .collect(),
+        |r| Ok(to_rules(r)?.fingerprint()),
+    )
+    .await?;
+    to_rules(&rows)
 }

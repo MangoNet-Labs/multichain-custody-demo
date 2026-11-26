@@ -19,9 +19,9 @@ pub(super) fn as_ref(i: &Input) -> ObjectRef {
     )
 }
 
-pub(super) fn build(s: &SponsoredSweep, price: u64) -> Result<Quote> {
+pub(super) fn build(s: &SponsoredSweep, coins: &[Input], amount: u64, price: u64) -> Result<Quote> {
     ensure!(
-        price > 0 && s.amount > 0 && s.budget > 0,
+        price > 0 && amount <= s.max_amount && s.budget > 0,
         "invalid sponsored sweep amount or fee"
     );
     let roles = HashSet::from([s.sender, s.recipient, s.sponsor]);
@@ -30,42 +30,23 @@ pub(super) fn build(s: &SponsoredSweep, price: u64) -> Result<Quote> {
         "invalid sponsored sweep roles"
     );
     ensure!(
-        !s.coins.is_empty() && !s.gas.is_empty() && s.coins.len() + s.gas.len() <= MAX_INPUTS,
+        !coins.is_empty() && !s.gas.is_empty() && coins.len() + s.gas.len() <= MAX_INPUTS,
         "invalid sponsored input count"
     );
     let mut seen = HashSet::new();
     ensure!(
-        s.coins.iter().chain(&s.gas).all(|i| seen.insert(i.id)),
+        coins.iter().chain(&s.gas).all(|i| seen.insert(i.id)),
         "overlapping Mango inputs"
     );
     let mut builder = ProgrammableTransactionBuilder::new();
-    let coins = s.coins.iter().map(as_ref).collect::<Vec<_>>();
+    let coins = coins.iter().map(as_ref).collect::<Vec<_>>();
     let gas = s.gas.iter().map(as_ref).collect::<Vec<_>>();
     let args = coins
         .iter()
         .map(|r| builder.obj(ObjectArg::ImmOrOwnedObject(*r)))
         .collect::<Result<Vec<_>>>()?;
     let recipient = MgoAddress::from_bytes(s.recipient)?;
-    if s.asset.is_empty() {
-        builder.transfer_args(recipient, args);
-    } else {
-        let tag = mgo_types::parse_mgo_type_tag(&s.asset)?;
-        ensure!(
-            matches!(&tag, mgo_types::TypeTag::Struct(_))
-                && !mgo_types::gas_coin::GAS::is_gas_type(&tag)
-                && tag.to_canonical_string(true) == s.asset,
-            "invalid sweep token"
-        );
-        let coins = builder.command(mgo_types::transaction::Command::MakeMoveVec(None, args));
-        let dest = builder.pure(recipient)?;
-        builder.programmable_move_call(
-            mgo_types::MGO_FRAMEWORK_PACKAGE_ID,
-            mgo_types::Identifier::new("pay")?,
-            mgo_types::Identifier::new("join_vec_and_transfer")?,
-            vec![tag],
-            vec![coins, dest],
-        );
-    }
+    builder.transfer_args(recipient, args);
     let tx = TransactionData::new_programmable_allow_sponsor(
         MgoAddress::from_bytes(s.sender)?,
         gas.clone(),
@@ -74,7 +55,7 @@ pub(super) fn build(s: &SponsoredSweep, price: u64) -> Result<Quote> {
         price,
         MgoAddress::from_bytes(s.sponsor)?,
     );
-    encoded(&tx, &[coins, gas].concat())
+    encoded(&tx, &[coins, gas].concat(), amount, false)
 }
 pub async fn sweep_quote_command() -> Result<()> {
     let mut buf = Vec::new();
@@ -83,8 +64,56 @@ pub async fn sweep_quote_command() -> Result<()> {
     let s: SponsoredSweep = serde_json::from_slice(&buf)?;
     let node = Node::from_env()?;
     node.verify().await?;
+    let quote = quote_page(&node, &s).await?;
+    println!("{}", serde_json::to_string(&quote)?);
+    Ok(())
+}
+
+async fn quote_page(node: &Node, s: &SponsoredSweep) -> Result<Quote> {
+    let asset = if s.asset.is_empty() {
+        super::MGO
+    } else {
+        &s.asset
+    };
+    let tag = mgo_types::parse_mgo_type_tag(asset)?;
+    ensure!(
+        !s.gas.is_empty() && s.gas.len() < MAX_INPUTS,
+        "invalid gas input count"
+    );
+    let limit = (MAX_INPUTS - s.gas.len()).min(50);
+    let page: super::Page = node
+        .call(
+            "mgox_getCoins",
+            json!([MgoAddress::from_bytes(s.sender)?, asset, null, limit]),
+        )
+        .await?;
+    ensure!(page.data.len() <= limit, "oversized Mango coin page");
+    if page.data.is_empty() {
+        return Ok(Quote::Waiting("no coin objects on the first page".into()));
+    }
+    let mut coins = Vec::new();
+    let mut amount = 0u64;
+    let mut ids = HashSet::new();
+    for c in page.data {
+        ensure!(
+            mgo_types::parse_mgo_type_tag(&c.coin_type)? == tag && ids.insert(c.coin_object_id),
+            "invalid coin in sweep page"
+        );
+        let balance = c.balance.parse::<u64>()?;
+        if balance > s.max_amount - amount {
+            return Ok(Quote::Waiting(
+                "coin page exceeds confirmed holdings".into(),
+            ));
+        }
+        coins.push(Input {
+            id: c.coin_object_id.into_bytes(),
+            version: c.version.parse()?,
+            digest: c.digest.into_inner(),
+        });
+        amount += balance;
+    }
     let price: String = node.call("mgox_getReferenceGasPrice", json!([])).await?;
-    let mut quote = build(&s, price.parse()?)?;
+    let mut quote = build(s, &coins, amount, price.parse()?)?;
     if let Quote::Ready { bytes, .. } = &quote {
         let dry: Value = node
             .call(
@@ -99,16 +128,10 @@ pub async fn sweep_quote_command() -> Result<()> {
         } else {
             // Transferring whole coin objects encodes no numeric amount. Check the
             // recipient's actual balance change before either wallet signs.
-            super::verify_gain(
-                &dry,
-                MgoAddress::from_bytes(s.recipient)?,
-                &s.asset,
-                s.amount,
-            )?;
+            super::verify_gain(&dry, MgoAddress::from_bytes(s.recipient)?, &s.asset, amount)?;
         }
     }
-    println!("{}", serde_json::to_string(&quote)?);
-    Ok(())
+    Ok(quote)
 }
 
 #[cfg(test)]
@@ -129,12 +152,12 @@ mod tests {
             sender: [1; 32],
             recipient: [2; 32],
             sponsor: [3; 32],
-            amount: 100,
+            max_amount: 100,
             budget: 10000000,
-            coins: vec![input(4), input(5)],
             gas: vec![input(6)],
         };
-        let Quote::Ready { bytes, inputs, .. } = build(&s, 1000)? else {
+        let coins = [input(4), input(5)];
+        let Quote::Ready { bytes, inputs, .. } = build(&s, &coins, 100, 1000)? else {
             unreachable!()
         };
         let tx: TransactionData = bcs::from_bytes(&bytes)?;
@@ -142,8 +165,8 @@ mod tests {
         assert_eq!(tx.gas_owner().to_inner(), s.sponsor);
         assert_eq!(tx.gas_data().payment, [as_ref(&s.gas[0])]);
         assert_eq!(inputs.len(), 3);
-        s.gas[0] = s.coins[0].clone();
-        assert!(build(&s, 1000).is_err());
+        s.gas[0] = coins[0].clone();
+        assert!(build(&s, &coins, 100, 1000).is_err());
         Ok(())
     }
 }

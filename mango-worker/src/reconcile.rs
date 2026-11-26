@@ -15,7 +15,16 @@ pub async fn run(
 ) -> Result<()> {
     let s = reconcile::snapshot(db, MangoTestnet).await?;
     // Additions committed after the snapshot cannot be active at its height.
-    let node = node.with_rules(super::registry::stored(db).await?);
+    // Audit holdings, not credit eligibility. An opening coin may last have
+    // moved before listing. Restrict this independent replay to snapshot assets.
+    let wanted: HashSet<_> = s.wallets.iter().map(|w| w.asset.as_slice()).collect();
+    let registry = super::registry::stored(db).await?;
+    let node = node.with_rules(mango_worker::rules::Rules::new(
+        registry
+            .entries()
+            .filter(|(t, _)| wanted.contains(t.coin_type.as_bytes()))
+            .map(|(t, _)| (t.clone(), 0)),
+    )?);
     let owners = s
         .wallets
         .iter()

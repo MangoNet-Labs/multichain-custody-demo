@@ -75,6 +75,7 @@ impl Observed {
             });
         }
         Ok(FinalizedBlock {
+            openings: self.openings,
             network: BscTestnet,
             height: height.try_into()?,
             digest: self.hash.0,
@@ -150,13 +151,12 @@ pub async fn run(
     MIGRATIONS.run(&db).await?;
     if cursor(&db, BscTestnet).await?.is_none() {
         let (head, _) = finalized(&source, &db, None).await?;
-        let anchor = match env::var("BSC_START_HEIGHT") {
-            Err(env::VarError::NotPresent) => Cursor {
+        let anchor = match custody_core::start_height("BSC_START_HEIGHT")? {
+            None => Cursor {
                 height: i64::try_from(head.number.to::<u64>())?,
                 digest: head.hash.0,
             },
-            Ok(raw) => {
-                let start: u64 = raw.parse().context("invalid inclusive BSC_START_HEIGHT")?;
+            Some(start) => {
                 ensure!(
                     start <= head.number.to::<u64>(),
                     "start height is not finalized"
@@ -178,7 +178,6 @@ pub async fn run(
                     }
                 }
             }
-            Err(e) => return Err(e.into()),
         };
         initialize(&db, BscTestnet, anchor).await?;
     }

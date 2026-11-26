@@ -27,15 +27,11 @@ async fn load_rules(actor: &Signer, net: Network) -> Result<()> {
         .await
 }
 
-async fn wait_for_rules(actor: &Signer, db: &PgPool, net: Network) {
+async fn wait_for_rules(actor: &Signer, net: Network) {
     loop {
-        match custody_store::wallets::network_ready(db, net).await {
-            Ok(true) => match load_rules(actor, net).await {
-                Ok(()) => return,
-                Err(e) => eprintln!("{} sweep configuration deferred: {e:#}", network_key(net)),
-            },
-            Ok(false) => (),
-            Err(e) => eprintln!("{} cursor unavailable: {e:#}", network_key(net)),
+        match load_rules(actor, net).await {
+            Ok(()) => return,
+            Err(e) => eprintln!("{} sweep configuration deferred: {e:#}", network_key(net)),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -77,6 +73,20 @@ async fn main() -> Result<()> {
     let db =
         PgPool::connect(&env::var("DATABASE_URL").context("DATABASE_URL is required")?).await?;
     MIGRATIONS.run(&db).await?;
+    if args[0] == "serve" || args[0].starts_with("bsc-") {
+        evm_reader::check_assets(&db).await?;
+    }
+    if args[0] == "serve" || args[0].starts_with("mango-") {
+        let helper = env::var_os("MANGO_WORKER_BIN").unwrap_or_else(|| "mango-worker".into());
+        let checked = std::process::Command::new(helper)
+            .arg("--init-assets")
+            .status()
+            .context("checking Mango asset configuration")?;
+        anyhow::ensure!(
+            checked.success(),
+            "Mango asset configuration rejected; signing disabled"
+        );
+    }
     let actor = Signer::open(db.clone(), &root, &unlock).await?;
     let max_fee = env::var("BSC_MAX_PAYOUT_FEE_WEI")
         .unwrap_or_else(|_| "1000000000000000".into())
@@ -136,7 +146,7 @@ async fn main() -> Result<()> {
             }
         };
         let sweeps = async {
-            wait_for_rules(&actor, &db, BscTestnet).await;
+            wait_for_rules(&actor, BscTestnet).await;
             loop {
                 if let Err(e) = actor.prepare_bsc_sweep(&node, max_fee).await {
                     eprintln!("BSC sweep deferred: {e:#}");
@@ -145,7 +155,7 @@ async fn main() -> Result<()> {
             }
         };
         let sponsored = async {
-            wait_for_rules(&actor, &db, MangoTestnet).await;
+            wait_for_rules(&actor, MangoTestnet).await;
             loop {
                 if let Err(e) = actor.prepare_configured_mango_sweep().await {
                     eprintln!("Mango sweep deferred: {e:#}");

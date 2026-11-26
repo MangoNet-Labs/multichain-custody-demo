@@ -14,7 +14,7 @@ trap 'exit 1' HUP INT TERM
 initdb -D "$tmp/data" -U demo --no-locale --encoding=UTF8 --auth-local=trust --auth-host=reject >/dev/null
 pg_ctl -D "$tmp/data" -l "$tmp/postgres.log" -o "-c listen_addresses='' -k $tmp" -w start
 export DATABASE_URL="postgresql://demo@localhost/postgres?host=$tmp"
-cargo test --locked -p custody-store --test postgres -- --ignored
+cargo test --locked -p custody-store --tests -- --ignored
 cargo test --locked -p evm-reader --bin evm-reader -- --ignored
 cargo test --locked -p custody-signer --tests -- --ignored
 cargo test --locked -p custody-web --test browser_flow -- --ignored
@@ -28,7 +28,7 @@ case "${1:-}" in
 --live-mango|--mango)
     network=mango-testnet
     unset MANGO_START_HEIGHT
-    (cd mango-worker && cargo test --locked --test checkpoint)
+    (cd mango-worker && cargo test --locked)
     (cd mango-worker && cargo test --locked --bin mango-worker -- --ignored)
     (cd mango-worker && cargo test --locked --test postgres -- --ignored)
     cargo build --locked -p custody-signer

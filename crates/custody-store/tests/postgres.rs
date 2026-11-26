@@ -76,29 +76,31 @@ async fn withdrawal_reservations_are_exact_idempotent_and_atomic(db: PgPool) -> 
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "run sh scripts/test-postgres.sh"]
-async fn token_activation_invalidates_prefetched_blocks(db: PgPool) -> anyhow::Result<()> {
+async fn registry_additions_start_at_next_height_and_invalidate_prefetch(
+    db: PgPool,
+) -> anyhow::Result<()> {
     use custody_store::{apply_with_rules, configure_tokens};
     setup(&db).await?;
-    let token: Vec<u8> =
-        sqlx::query_scalar("SELECT asset FROM assets WHERE octet_length(asset)=20")
-            .fetch_one(&db)
-            .await?;
-    let first = (token.try_into().unwrap(), "MGO".to_owned(), 9);
+    let first = ([7; 20], "MGO".to_owned(), 9);
     let v1 = configure_tokens(&db, vec![first.clone()]).await?;
     apply_with_rules(&db, &block(11, vec![]), Some(v1)).await?;
-    let v2 = configure_tokens(&db, vec![first.clone(), ([5; 20], "TEST".into(), 18)]).await?;
+    let added = ([5; 20], "TEST".to_owned(), 18);
+    let v2 = configure_tokens(&db, vec![first.clone(), added.clone()]).await?;
+    assert_ne!(v1, v2);
     assert!(apply_with_rules(&db, &block(12, vec![]), Some(v1))
         .await
         .is_err());
-    assert!(configure_tokens(&db, vec![first]).await.is_err());
+    assert!(configure_tokens(&db, vec![]).await.is_err());
+    assert!(configure_tokens(&db, vec![(first.0, "OTHER".into(), 9)])
+        .await
+        .is_err());
+    assert!(apply_with_rules(&db, &block(12, vec![]), Some([0; 32]))
+        .await
+        .is_err());
     assert_eq!(cursor(&db, BscTestnet).await?.unwrap().height, 11);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT enabled_from FROM assets WHERE symbol='TEST'")
-            .fetch_one(&db)
-            .await?,
-        12
-    );
-    apply_with_rules(&db, &block(12, vec![]), Some(v2)).await?;
+    let restored = configure_tokens(&db, vec![first, added]).await?;
+    assert_eq!(v2, restored);
+    apply_with_rules(&db, &block(12, vec![]), Some(restored)).await?;
     Ok(())
 }
 
@@ -112,8 +114,103 @@ fn candidate(id: u8, recipient: u8, amount: &str) -> Receipt {
         log: None,
     }
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "run sh scripts/test-postgres.sh"]
+async fn opening_is_frozen_once_and_a_full_sweep_moves_but_does_not_credit_it(
+    db: PgPool,
+) -> anyhow::Result<()> {
+    use custody_store::{apply_with_rules, configure_tokens, reconcile, OpeningDelta};
+    setup(&db).await?;
+    let original = ([8; 20], "OLD".to_owned(), 6);
+    let new = ([5; 20], "NEW".to_owned(), 6);
+    let r1 = configure_tokens(&db, vec![original.clone()]).await?;
+    let mut before = block(11, vec![]);
+    for (owner, n) in [(1, "5"), (1, "-1"), (33, "12")] {
+        before.openings.push(OpeningDelta {
+            address: vec![owner; 20],
+            asset: new.0.to_vec(),
+            delta: n.into(),
+        });
+    }
+    apply_with_rules(&db, &before, Some(r1)).await?;
+    assert_eq!(
+        apply_with_rules(&db, &before, Some(r1)).await?,
+        Applied::AlreadyCommitted
+    );
+    before.openings[0].delta = "8".into();
+    assert!(apply_with_rules(&db, &before, Some(r1)).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sweep_checks")
+            .fetch_one(&db)
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM opening_balances")
+            .fetch_one(&db)
+            .await?,
+        1
+    );
+    let r2 = configure_tokens(&db, vec![new.clone(), original.clone()]).await?;
+    let checkpoint: (i64, Vec<u8>) =
+        sqlx::query_as("SELECT enabled_from,opening_digest::bytea FROM assets WHERE symbol='NEW'")
+            .fetch_one(&db)
+            .await?;
+    assert_eq!(checkpoint, (12, vec![11; 32]));
+    let transfer = |tx: u8, from: u8, to: u8, amount: &str| Receipt {
+        tx: [tx; 32],
+        recipient: vec![to; 20],
+        sender: Some(vec![from; 20]),
+        asset: new.0.to_vec(),
+        amount: amount.into(),
+        log: Some((0, 0)),
+    };
+    let incoming = block(12, vec![transfer(12, 9, 1, "2")]);
+    assert!(apply_with_rules(&db, &incoming, Some(r1)).await.is_err());
+    apply_with_rules(&db, &incoming, Some(r2)).await?;
+    apply_with_rules(&db, &block(13, vec![transfer(13, 1, 3, "6")]), Some(r2)).await?;
+    assert_eq!(
+        configure_tokens(&db, vec![original, new.clone()]).await?,
+        r2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT amount::text FROM opening_balances")
+            .fetch_one(&db)
+            .await?,
+        "4"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT sum(delta)::text FROM journal_entries WHERE account='user:alice:available'"
+        )
+        .fetch_one(&db)
+        .await?,
+        "2"
+    );
+    let snap = reconcile::snapshot(&db, BscTestnet).await?;
+    let observations = snap
+        .wallets
+        .iter()
+        .map(|w| {
+            (
+                (w.address.clone(), w.asset.clone()),
+                if w.address == vec![3; 20] && w.asset == new.0 {
+                    "6"
+                } else {
+                    "0"
+                }
+                .into(),
+            )
+        })
+        .collect();
+    assert!(reconcile::finish(&db, snap, observations).await?.1);
+    Ok(())
+}
+
 fn block(height: i64, receipts: Vec<Receipt>) -> FinalizedBlock {
     FinalizedBlock {
+        openings: vec![],
         network: BscTestnet,
         height,
         digest: [height as u8; 32],
@@ -215,16 +312,18 @@ async fn concurrent_replay_and_separate_internal_funding(db: PgPool) -> anyhow::
     let mut topup = candidate(2, 2, "300");
     topup.sender = Some(vec![3; 20]);
     let mut token = candidate(1, 1, "1000000000");
-    token.asset = sqlx::query_scalar("SELECT asset FROM assets WHERE octet_length(asset)=20")
-        .fetch_one(&db)
-        .await?;
+    let contract = [7; 20];
+    let rules =
+        Some(custody_store::configure_tokens(&db, vec![(contract, "MGO".into(), 9)]).await?);
+    token.asset = contract.to_vec();
     token.log = Some((0, 0));
     let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
     let b = block(
         11,
         vec![candidate(1, 1, max), token, topup, candidate(3, 200, "99")],
     );
-    let (a, z) = tokio::join!(apply(&db, &b), apply(&db, &b));
+    let apply_block = |block| custody_store::apply_with_rules(&db, block, rules);
+    let (a, z) = tokio::join!(apply_block(&b), apply_block(&b));
     let outcomes = [a?, z?];
     assert!(
         outcomes.contains(&Applied::Committed { deposits: 2 })
@@ -245,7 +344,9 @@ async fn concurrent_replay_and_separate_internal_funding(db: PgPool) -> anyhow::
     );
     let mut conflicting = b;
     conflicting.receipts[1].amount = "2".into();
-    assert!(apply(&db, &conflicting).await.is_err());
+    assert!(custody_store::apply_with_rules(&db, &conflicting, rules)
+        .await
+        .is_err());
     assert_eq!(
         initialize(
             &db,
@@ -325,6 +426,7 @@ async fn mango_net_changes_in_one_tx_are_per_owner(db: PgPool) -> anyhow::Result
         });
     }
     let b = FinalizedBlock {
+        openings: vec![],
         network: MangoTestnet,
         height: 5,
         digest: [5; 32],

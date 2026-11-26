@@ -10,6 +10,12 @@ The signer signs a payment, the broadcaster sends it, and the scanner settles it
 
 Install Docker Compose v2 with BuildKit and OpenSSL. From the project root, on a **new installation**:
 
+This release uses a single [initial schema](migrations/0001_init.sql) and requires an empty database on first use. It does not migrate earlier demo installations. Keep any funded installation and its keys intact.
+
+Choose the [testnet asset lists](docs/SCANNERS.md) before the first startup.
+Compose validates both lists before starting scanners, signing or broadcasting.
+You can [add tokens later](docs/SCANNERS.md#adding-a-token-to-an-existing-installation) without resetting wallets or replaying history. Only transfers after activation can credit a user.
+
 ```sh
 sh scripts/configure.sh
 docker compose build web mango signer
@@ -30,6 +36,7 @@ To stop and restart the same installation, use `docker compose stop` and `docker
 | --- | --- |
 | Run a deposit or withdrawal, check scanner health, back up wallets or reconcile funds | [Operating the demo](docs/OPERATIONS.md) |
 | Trace a transfer from chain evidence to a user's balance | [Follow a deposit](docs/FOLLOW_THE_MONEY.md) |
+| Implement another chain and verify it against the same custody rules | [Chain integration contract](docs/CHAIN_INTEGRATION.md) |
 | Build a reader, configure an RPC or understand which transfers count | [Mango and BSC scanners](docs/SCANNERS.md) |
 | Understand payment states, gas top-ups, sponsored sweeps or retries | [Withdrawals and sweeps](docs/PAYMENTS.md) |
 | Run regression tests, restart checks or a catch-up benchmark | [Testing](docs/TESTING.md) |

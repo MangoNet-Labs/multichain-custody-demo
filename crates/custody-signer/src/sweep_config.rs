@@ -21,6 +21,15 @@ impl Signer {
         let config: Config = toml::from_str(contents)?;
         let network_name = custody_store::network_key(network);
         let mut tx = self.db.begin().await?;
+        let ready: bool =
+            sqlx::query_scalar("SELECT initialized FROM asset_registries WHERE network=$1")
+                .bind(network_name)
+                .fetch_one(&mut *tx)
+                .await?;
+        ensure!(
+            ready,
+            "{network_name} scanner has not activated its asset list yet"
+        );
         sqlx::query("LOCK TABLE sweep_rules IN SHARE ROW EXCLUSIVE MODE")
             .execute(&mut *tx)
             .await?;
@@ -65,6 +74,12 @@ impl Signer {
         .await?;
         let old: BTreeMap<_, _> = old.into_iter().map(|(n, a, m)| ((n, a), m)).collect();
         if rules != old {
+            let changed_existing = old.iter().any(|(key, value)| rules.get(key) != Some(value));
+            let added: Vec<_> = rules
+                .keys()
+                .filter(|k| !old.contains_key(*k))
+                .map(|(_, a)| a.clone())
+                .collect();
             sqlx::query("DELETE FROM sweep_rules WHERE network=$1")
                 .bind(network_name)
                 .execute(&mut *tx)
@@ -78,9 +93,15 @@ impl Signer {
                     .await?;
             }
             sqlx::query(
-                "UPDATE sweep_checks SET revision=revision+1,next_check=now() WHERE network=$1",
+                "UPDATE sweep_checks SET revision=revision+1,
+                 next_check=CASE WHEN finalized_failures>0 THEN greatest(next_check,now()) ELSE now() END
+                 WHERE network=$1 AND finalized_failures<4 AND ($2 OR EXISTS (
+                   SELECT 1 FROM deposits d WHERE d.network=sweep_checks.network
+                   AND d.recipient=sweep_checks.address AND d.asset=ANY($3::bytea[])))",
             )
             .bind(network_name)
+            .bind(changed_existing)
+            .bind(added)
             .execute(&mut *tx)
             .await?;
         }

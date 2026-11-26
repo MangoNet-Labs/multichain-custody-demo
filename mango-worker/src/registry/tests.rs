@@ -1,9 +1,11 @@
 use super::*;
+use crate::{reconcile, Cursor, Node};
 use axum::{routing::get, Router};
 use custody_core::Network::MangoTestnet;
 use custody_store::{apply_mango_full, apply_mango_with_rules, initialize, Applied};
 use mango_worker::{decode_full, decode_with_rules};
 use mgo_types::{full_checkpoint_content::CheckpointData, gas_coin::GAS};
+use std::num::NonZeroUsize;
 
 const MIXED: &[u8] = include_bytes!("../../tests/fixtures/localnet-mixed-assets.bcs");
 fn token() -> Token {
@@ -93,8 +95,8 @@ async fn mixed_deposit_replay_and_independent_inventory(db: PgPool) -> Result<()
     let node = node();
     let t = token();
     let wanted = Rules::new([(t.clone(), 0)])?;
-    let rules = activate(&db, &node, limits(), &wanted).await?;
-    assert_eq!(rules.entries().next().unwrap().1, 142);
+    let rules = activate(&db, &wanted).await?;
+    assert_eq!(rules.entries().next().unwrap().1, 0);
     let (b, exec, coins) = decode_with_rules(MIXED, 142, &rules)?;
     let (stale, _, _) = decode_full(MIXED, 142)?;
     assert!(apply_mango_full(&db, &stale, &exec, &coins).await.is_err());
@@ -123,11 +125,9 @@ async fn mixed_deposit_replay_and_independent_inventory(db: PgPool) -> Result<()
     for _ in 0..2 {
         reconcile::run(&db, &node, limits().0, limits().1).await?;
     }
-    assert!(activate(&db, &node, limits(), &Rules::default())
-        .await
-        .is_err());
+    assert!(activate(&db, &Rules::default()).await.is_err());
     assert_eq!(
-        activate(&db, &node, limits(), &wanted).await?.fingerprint(),
+        activate(&db, &wanted).await?.fingerprint(),
         rules.fingerprint()
     );
     Ok(())
@@ -135,27 +135,24 @@ async fn mixed_deposit_replay_and_independent_inventory(db: PgPool) -> Result<()
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "run sh scripts/test-postgres.sh --mango"]
-async fn existing_token_holdings_abort_activation_without_retrocredit(db: PgPool) -> Result<()> {
+async fn native_only_scanner_records_opening_without_credit(db: PgPool) -> Result<()> {
     setup(&db).await?;
+    let initial = activate(&db, &Rules::default()).await?;
+    assert!(initial.fingerprint().is_none());
     let (b, exec, coins) = decode_full(MIXED, 142)?;
     apply_mango_full(&db, &b, &exec, &coins).await?;
-    let n = node();
-    let wanted = Rules::new([(token(), 0)])?;
-    let err = activate(&db, &n, limits(), &wanted)
-        .await
-        .err()
-        .context("expected rejection")?;
-    ensure!(
-        err.to_string().contains("nonzero opening balance"),
-        "{err:#}"
-    );
-    assert!(stored(&db).await?.fingerprint().is_none());
-    let absent = Token {
-        coin_type: "0xbeef::test::TEST".into(),
-        ..token()
-    };
-    let rules = activate(&db, &n, limits(), &Rules::new([(absent, 0)])?).await?;
-    assert_eq!(rules.entries().next().unwrap().1, 143);
-    reconcile::run(&db, &n, limits().0, limits().1).await?;
+    let asset = token();
+    let before: String = sqlx::query_scalar(
+        "SELECT amount::text FROM opening_balances WHERE address=$1 AND asset=$2",
+    )
+    .bind([0xaau8; 32].as_slice())
+    .bind(asset.coin_type.as_bytes())
+    .fetch_one(&db)
+    .await?;
+    assert_eq!(before, "50000000000");
+    let active = activate(&db, &Rules::new([(asset, 0)])?).await?;
+    assert_eq!(active.entries().next().unwrap().1, 143);
+    assert!(activate(&db, &Rules::default()).await.is_err());
+    reconcile::run(&db, &node(), limits().0, limits().1).await?;
     Ok(())
 }

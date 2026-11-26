@@ -136,6 +136,10 @@ pub fn activity(
                     dt{(if deposits{"Sender"}else{"Recipient"})} dd{(e.address.as_ref().map(|a|address(&e.net,a)).unwrap_or_else(||"Not attributed".into()))}
                 @if let Some(tx)=&e.tx {dt{(if deposits{"Transaction"}else{"Signed transaction"})} dd{(digest(&e.net,tx))}}
                 @if let Some(tx)=&e.confirmed_tx {dt{"Finalized transaction"} dd{(digest(&e.net,tx))}}
+                @if let Some(tx)=&e.merge_tx {dt{"Latest hot-wallet consolidation"} dd{(digest(&e.net,tx))}}
+                @if !deposits && e.status=="submitted" && e.height.is_none() {
+                    dt{"Confirmation"} dd{"Waiting for finalized chain evidence. The withdrawal amount remains reserved."}
+                }
                     @if let Some(h)=e.height {dt{"Finalized height"} dd{(h)}}
                     @if let Some(fee)=&e.gas {dt{"Platform net gas"} dd{@if e.net=="mango-testnet"{(units(fee,9)) " MGO"}@else{(units(fee,18)) " BNB"}}}
                     @if let Some(info)=&e.detail {dt{"Status detail"} dd{(info)}}
@@ -190,12 +194,19 @@ pub fn operations(user: &str, ops: Operations) -> Markup {
                         @if let Some(t)=a.coin_type {dt{"Coin type"} dd{(t)}}
                         dt{"Users: available / frozen"} dd{(units(&a.available,a.decimals)) " / " (units(&a.frozen,a.decimals))}
                         dt{"Platform capital"} dd{(units(&a.capital,a.decimals))} dt{"Net fees paid"} dd{(units(&a.fees,a.decimals))}
+                        dt{"Known pre-listing balance (not credited)"} dd{(units(&a.opening,a.decimals))}
                     }
                 }}
                 @for w in ops.observed {details.entry{summary{b{(net(&w.net)) " · " (w.role)} span{(units(&w.observed,w.decimals)) " " (w.symbol)} span.tag{(if w.matched{"Matched"}else{"Mismatch"})}}
                     dl{dt{"Wallet"} dd{(address(&w.net,&w.address))} @if let Some(t)=w.coin_type {dt{"Coin type"} dd{(t)}} dt{"Expected"} dd{(units(&w.expected,w.decimals))} dt{"Observed"} dd{(units(&w.observed,w.decimals))}}
                 }}
             }
+            @if !ops.openings.is_empty() {section {h2{"Pre-listing balances (not credited)"}
+                @for o in ops.openings {details.entry{summary{b{(net(&o.net)) " / " (o.symbol)} span{
+                    (units(&o.amount,o.decimals))}}
+                    dl{dt{"Original wallet"} dd{(address(&o.net,&o.address))} dt{"Opening height"} dd{(o.height)}
+                    dt{"Asset"} dd{(if o.net=="mango-testnet"{String::from_utf8_lossy(&o.asset).into_owned()}else{address(&o.net,&o.asset)})}}}}
+            }}
             section {h2{"Recent sweeps"} @if ops.sweeps.is_empty(){p.empty{"No sweep transactions."}}
                 @for s in ops.sweeps {details.entry {summary{span{(if s.kind=="gas_topup"{"Gas top-up"}else{"Sweep"})} strong{(units(&s.amount,s.decimals)) " " (s.symbol)} span.tag{(s.status)}}
                     dl{dt{"Network"} dd{(net(&s.net))} dt{"From"} dd{(address(&s.net,&s.sender))} dt{"To"} dd{(address(&s.net,&s.recipient))}

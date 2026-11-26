@@ -8,13 +8,19 @@ to a public chain. First-time builds need internet access to fetch dependencies.
 | --- | --- |
 | `cargo test --workspace --locked` | Core logic, the bounded fetch pipeline, BSC receipt decoding and signer unit tests. PostgreSQL integration tests are run separately. |
 | `sh scripts/test-postgres.sh` | Ledger posting and replay, wallet allocation, BSC payments, gas funding, sweeps and web flows against an isolated PostgreSQL cluster. Requires PostgreSQL server and client tools on PATH. |
-| `sh scripts/test-postgres.sh --mango` | Also runs the Mango checkpoint fixtures and payment tests, including coin reservations and sponsored sweeps. The [worker build](SCANNERS.md#mango-build-and-inspect-the-worker) fetches its pinned Git dependencies automatically. |
+| `sh scripts/test-postgres.sh --mango` | Also runs Mango checkpoint fixtures and sponsored sweeps: an empty page creates no order, a page of zero-balance objects moves to hot before the next batch, the wrong final owner prevents settlement, and internal transfers never credit the user. The [worker build](SCANNERS.md#mango-build-and-inspect-the-worker) fetches its pinned Git dependencies automatically. |
 | `sh scripts/test-docker-migrations.sh` | Builds the app and runs its migrations twice against fresh PostgreSQL 17 in Docker. It does not use the Demo's database or keystore. |
 
 To trace a failure, start with the [BSC decoder tests](../crates/evm-reader/tests/scan.rs),
 [ledger replay tests](../crates/custody-store/tests/postgres.rs),
 [BSC payment tests](../crates/custody-signer/tests/payout.rs) or
 [Mango payment tests](../mango-worker/tests/payout.rs).
+
+The [fragmented hot-wallet tests](../mango-worker/tests/payout/fragmentation.rs)
+exercise native and token withdrawals from 10,000 small coins, five consecutive
+first-page consolidations without following a cursor, a full last page with
+insufficient funds, concurrent checkpoint writes, a competing queued withdrawal, lost broadcast acknowledgements,
+checkpoint replay and a failed consolidation without releasing the principal.
 
 The [CI workflow](../.github/workflows/acceptance.yml) runs the workspace tests,
 PostgreSQL/Mango suite and Docker migration check on pushes and pull requests.

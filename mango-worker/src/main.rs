@@ -164,6 +164,14 @@ async fn catch_up(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if args == ["--init-assets"] || args == ["--broadcast"] || args == ["--broadcast-once"] {
+        let db = PgPool::connect(&env::var("DATABASE_URL")?).await?;
+        MIGRATIONS.run(&db).await?;
+        registry::validate_config(&db, &registry::configured()?).await?;
+        if args == ["--init-assets"] {
+            return Ok(());
+        }
+    }
     if args == ["--quote-sweep"] {
         return payments::sweep_quote_command().await;
     }
@@ -260,12 +268,9 @@ async fn main() -> Result<()> {
             node.header(None).await,
         )
         .await?;
-        let anchor = match env::var("MANGO_START_HEIGHT") {
-            Err(env::VarError::NotPresent) => tip,
-            Ok(raw) => {
-                let start: u64 = raw
-                    .parse()
-                    .context("invalid inclusive MANGO_START_HEIGHT")?;
+        let anchor = match custody_core::start_height("MANGO_START_HEIGHT")? {
+            None => tip,
+            Some(start) => {
                 ensure!(
                     start <= tip.height as u64,
                     "start checkpoint is not finalized"
@@ -279,13 +284,10 @@ async fn main() -> Result<()> {
                     node.header(Some(start - 1)).await?
                 }
             }
-            Err(e) => return Err(e.into()),
         };
         initialize(&db, MangoTestnet, anchor).await?;
     }
-    let node = node.with_rules(
-        registry::activate(&db, &node, (parallel, ready), &registry::configured()?).await?,
-    );
+    let node = node.with_rules(registry::activate(&db, &registry::configured()?).await?);
     let mut delay = 1;
     let mut pace = HeadPace::default();
     let mut limit = FetchLimit::new(parallel);

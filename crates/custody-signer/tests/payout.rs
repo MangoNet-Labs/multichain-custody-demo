@@ -8,7 +8,7 @@ use custody_core::{
 };
 use custody_signer::{create_unlock_file, Signer};
 use custody_store::{
-    apply, apply_evidence, initialize,
+    apply_evidence, apply_with_rules, configure_tokens, initialize,
     payouts::Execution,
     wallets::Purpose,
     withdrawals::{submit, Request},
@@ -139,6 +139,19 @@ enum End {
     NoTransfer,
     OtherNonceUser,
 }
+
+async fn register_test_tokens(db: &PgPool) -> Result<[u8; 32]> {
+    let tokens = evm_reader::allowlist(include_bytes!("../../../config/bsc-testnet-tokens.json"))?;
+    configure_tokens(
+        db,
+        tokens
+            .into_values()
+            .map(|t| (t.contract.into_array(), t.symbol, t.decimals))
+            .collect(),
+    )
+    .await
+}
+
 async fn exercise(db: PgPool, end: End) -> Result<()> {
     let server = Server::new().await?;
     for n in [BscTestnet, MangoTestnet] {
@@ -152,6 +165,7 @@ async fn exercise(db: PgPool, end: End) -> Result<()> {
         )
         .await?;
     }
+    let rules = Some(register_test_tokens(&db).await?);
     let tmp = tempfile::tempdir()?;
     let unlock = tmp.path().join("secret/unlock");
     create_unlock_file(&unlock)?;
@@ -184,6 +198,7 @@ async fn exercise(db: PgPool, end: End) -> Result<()> {
         log: token.then_some((0, 0)),
     };
     let block = |h: u8, receipts| FinalizedBlock {
+        openings: vec![],
         network: BscTestnet,
         height: h.into(),
         digest: [h; 32],
@@ -201,7 +216,7 @@ async fn exercise(db: PgPool, end: End) -> Result<()> {
             log: None,
         });
     }
-    apply(&db, &block(11, receipts)).await?;
+    apply_with_rules(&db, &block(11, receipts), rules).await?;
     let order = submit(
         &db,
         Request {
@@ -306,9 +321,9 @@ async fn exercise(db: PgPool, end: End) -> Result<()> {
         vec![]
     };
     let b = block(12, receipts);
-    apply_evidence(&db, &b, None, Some(&exec)).await?;
+    apply_evidence(&db, &b, rules, Some(&exec)).await?;
     assert_eq!(
-        apply_evidence(&db, &b, None, Some(&exec)).await?,
+        apply_evidence(&db, &b, rules, Some(&exec)).await?,
         Applied::AlreadyCommitted
     );
     let status: String =
@@ -395,7 +410,7 @@ async fn exercise(db: PgPool, end: End) -> Result<()> {
             success: true,
             fee: "21000".into(),
         }];
-        apply_evidence(&db, &swept, None, Some(&effects)).await?;
+        apply_evidence(&db, &swept, rules, Some(&effects)).await?;
         let after:(String,i64,i64,String) = sqlx::query_as(
             "SELECT (SELECT status FROM sweep_orders),(SELECT count(*) FROM deposits),(SELECT count(*) FROM internal_receipts),
              (SELECT sum(delta)::text FROM journal_entries WHERE account='user:alice:available')").fetch_one(&db).await?;
@@ -454,6 +469,8 @@ async fn sweep_threshold_case(db: PgPool, shortfall: u128) -> Result<()> {
     let hot = Address::from_slice(&signer.wallet(BscTestnet, Purpose::Hot).await?.address);
     let gas = Address::from_slice(&signer.wallet(BscTestnet, Purpose::Gas).await?.address);
     let config = include_str!("../../../config/sweep.example.toml");
+    let rules = Some(register_test_tokens(&db).await?);
+    custody_store::registry::activate(&db, MangoTestnet, vec![], |_| Ok(None)).await?;
     signer.configure_sweeps(MangoTestnet, config).await?;
     signer.configure_sweeps(BscTestnet, config).await?;
     assert_eq!(
@@ -473,6 +490,7 @@ async fn sweep_threshold_case(db: PgPool, shortfall: u128) -> Result<()> {
             .fetch_one(&db)
             .await?;
     let block = |h: u8, receipts| FinalizedBlock {
+        openings: vec![],
         network: BscTestnet,
         height: h.into(),
         digest: [h; 32],
@@ -490,6 +508,13 @@ async fn sweep_threshold_case(db: PgPool, shortfall: u128) -> Result<()> {
     let donor = Address::from([99; 20]);
     let cap = U256::from(1_000_000_000_000_000u64);
     const TOKEN: u64 = 1_000_000_000;
+    let original_assets = vec![(token.clone(), "MGO".to_owned(), 9)];
+    assert!(
+        custody_store::registry::validate_config(&db, BscTestnet, vec![])
+            .await
+            .is_err()
+    );
+    custody_store::registry::validate_config(&db, BscTestnet, original_assets.clone()).await?;
     const BNB: u128 = 10_000_000_000_000_000;
     const ACTUAL_FEE: u128 = 40_000_000_000_000;
     server.state.lock().unwrap().sweep = Some(SweepState {
@@ -499,24 +524,32 @@ async fn sweep_threshold_case(db: PgPool, shortfall: u128) -> Result<()> {
         gas_funds: 0,
         deposit_nonce: 0,
     });
-    apply(
+    apply_with_rules(
         &db,
         &block(
             11,
             vec![receipt([1; 32], donor, deposit, &token, (TOKEN - 1).into())],
         ),
+        rules,
     )
     .await?;
     assert!(!signer.prepare_bsc_sweep(&server.rpc, cap).await?);
+    assert!(
+        custody_store::registry::validate_config(&db, BscTestnet, vec![])
+            .await
+            .is_err()
+    );
+    custody_store::registry::validate_config(&db, BscTestnet, original_assets).await?;
     assert!(
         sqlx::query_scalar::<_, bool>("SELECT next_check IS NULL FROM sweep_checks")
             .fetch_one(&db)
             .await?
     );
     server.state.lock().unwrap().sweep.as_mut().unwrap().token = TOKEN;
-    apply(
+    apply_with_rules(
         &db,
         &block(12, vec![receipt([2; 32], donor, deposit, &token, 1)]),
+        rules,
     )
     .await?;
     assert!(!signer.prepare_bsc_sweep(&server.rpc, cap).await?);
@@ -625,9 +658,9 @@ async fn sweep_threshold_case(db: PgPool, shortfall: u128) -> Result<()> {
             success: true,
             fee: ACTUAL_FEE.to_string(),
         }];
-        apply_evidence(&db, &b, None, Some(&e)).await?;
+        apply_evidence(&db, &b, rules, Some(&e)).await?;
         assert_eq!(
-            apply_evidence(&db, &b, None, Some(&e)).await?,
+            apply_evidence(&db, &b, rules, Some(&e)).await?,
             Applied::AlreadyCommitted
         );
         assert_eq!(

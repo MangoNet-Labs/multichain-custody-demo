@@ -22,6 +22,8 @@ Start with the [Docker quickstart](../README.md#docker-quickstart). Commands on 
 
 Use `docker compose logs --tail=30 mango bsc signer` to distinguish node errors from wallet provisioning issues. **Operations → Pause payments** stops new signing and sends, not scanning or settlement. It cannot recall an in-flight transaction.
 
+A Mango withdrawal in `review` blocks all further withdrawals from the Mango hot wallet. The global **Resume payments** button does not resolve an order in review. Inspect the signed digest and finalized checkpoint before deciding how to resolve it; do not retry it as a new payment.
+
 ## Preserve wallets across restarts
 
 Alice and Bob exist on every install, but their addresses do not. Each account gets one random deposit key per network. The database holds a key reference, not the private key. On BSC, BNB and tokens share the same deposit address but have separate balances.
@@ -29,6 +31,7 @@ Alice and Bob exist on every install, but their addresses do not. Each account g
 - Stop the stack with `docker compose stop`; restart with `docker compose up -d` (or add `--build` for source changes). Do not remove named volumes.
 - To move the installation, stop the old instance and back up the matching PostgreSQL database, encrypted keystore and separately held unlock credential. Restore all three together. Do not generate a replacement key for an address that has already been issued.
 - Compose runs the [schema migration](../migrations/0001_init.sql) automatically. The public baseline is for a fresh installation, not an upgrade from a pre-release database. Do not clear SQLx history to force it to run.
+- Earlier database layouts are unsupported. Use a separate Compose project and new volumes for a new installation; do not reuse the old keystore with a new database. Keep the old database, keystore and unlock credential together while it holds funds or pending payments. The one-shot `assets` service validates configuration before the workers start.
 
 ## Native wallet tools
 
@@ -65,5 +68,7 @@ docker compose exec -T mango mango-worker --reconcile
 BSC needs historical BNB balances and ERC-20 `balanceOf` at the chosen block. Mango rebuilds a separate in-memory coin inventory from full checkpoints, not from the scanner's coin table. The first audit starts at the installation's anchor with zero holdings for newly generated addresses. A matched prior audit can be reused for the same set of wallets. The node must serve that range; no raw checkpoints are written to disk.
 
 In **Operations → Reconciliation**, compare book and chain totals, available and frozen balances, capital, fees and per-wallet differences. A proven mismatch pauses new payments **across both networks**. Fix the cause, rerun the affected network's audit, then explicitly resume payments. An RPC error neither proves a mismatch nor clears a hold.
+
+**Pre-listing balances (not credited)** are custody holdings observed between address issuance and listing, not user liabilities. A sweep can move these holdings without creating a deposit. Only the finalized scanner settles payments; an RPC coin page does not update the ledger.
 
 For missing historical platform funding entries, `docker compose exec -T bsc evm-reader --backfill-funding HEIGHT` or `docker compose exec -T mango mango-worker --backfill-funding HEIGHT` requires a complete block matching the previously committed evidence. Neither command sends funds, advances the cursor or credits a user.

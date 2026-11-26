@@ -40,6 +40,24 @@ pub fn allowlist(json: &[u8]) -> Result<HashMap<Address, Token>> {
     Ok(tokens)
 }
 
+pub fn configured_tokens() -> Result<HashMap<Address, Token>> {
+    let path = std::env::var("BSC_TOKEN_ALLOWLIST")
+        .unwrap_or_else(|_| "config/bsc-testnet-tokens.json".into());
+    allowlist(&std::fs::read(&path).with_context(|| format!("reading {path}"))?)
+}
+
+pub async fn check_assets(db: &custody_store::PgPool) -> Result<()> {
+    custody_store::registry::validate_config(
+        db,
+        custody_core::Network::BscTestnet,
+        configured_tokens()?
+            .into_values()
+            .map(|t| (t.contract.to_vec(), t.symbol, t.decimals.into()))
+            .collect(),
+    )
+    .await
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Block {
@@ -118,6 +136,16 @@ pub fn scan_matching(
     tokens: &HashMap<Address, Token>,
     accepts: impl Fn(&Address) -> bool,
 ) -> Result<(Vec<Incoming>, Vec<custody_store::payouts::Execution>)> {
+    scan_observed(block, receipts, tokens, accepts, &mut Vec::new())
+}
+
+pub fn scan_observed(
+    block: &Block,
+    receipts: &[Receipt],
+    tokens: &HashMap<Address, Token>,
+    accepts: impl Fn(&Address) -> bool,
+    openings: &mut Vec<custody_store::OpeningDelta>,
+) -> Result<(Vec<Incoming>, Vec<custody_store::payouts::Execution>)> {
     ensure!(
         receipts.len() == block.transactions.len(),
         "receipt count mismatch"
@@ -182,9 +210,31 @@ pub fn scan_matching(
                 "inconsistent receipt log"
             );
             next_log += 1;
-            if !tokens.contains_key(&log.address)
-                || log.topics.first() != Some(&Transfer::SIGNATURE_HASH)
-            {
+            if log.topics.first() != Some(&Transfer::SIGNATURE_HASH) {
+                continue;
+            }
+            if !tokens.contains_key(&log.address) {
+                // ERC-721 shares the signature, but not the indexed layout.
+                if log.topics.len() == 3 && log.data.len() == 32 {
+                    if let Ok(e) =
+                        Transfer::decode_raw_log_validate(log.topics.iter().copied(), &log.data)
+                    {
+                        if e.from != e.to && e.value != U256::ZERO {
+                            for (addr, delta) in [
+                                (e.from, format!("-{}", e.value)),
+                                (e.to, e.value.to_string()),
+                            ] {
+                                if !addr.is_zero() && accepts(&addr) {
+                                    openings.push(custody_store::OpeningDelta {
+                                        address: addr.to_vec(),
+                                        asset: log.address.to_vec(),
+                                        delta,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             ensure!(

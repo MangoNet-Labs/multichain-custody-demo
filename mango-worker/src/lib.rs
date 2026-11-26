@@ -35,6 +35,7 @@ fn add_coin(
 fn changes(
     tx: &CheckpointTransaction,
     coins: &mut Changes,
+    unlisted: &mut BTreeMap<(MgoAddress, Vec<u8>), i128>,
     rules: &Rules,
     height: u64,
 ) -> Result<Vec<Receipt>> {
@@ -81,6 +82,8 @@ fn changes(
             if let Some(asset) = rules.asset(old, height) {
                 add_coin(&mut net, old, asset, -1)?;
                 coins.insert(id.into_bytes(), None);
+            } else if let Some(tag) = old.coin_type_maybe() {
+                add_coin(unlisted, old, tag.to_canonical_string(true).as_bytes(), -1)?;
             }
         }
     }
@@ -115,6 +118,8 @@ fn changes(
                 None
             };
             coins.insert(id.into_bytes(), coin);
+        } else if let Some(tag) = obj.coin_type_maybe() {
+            add_coin(unlisted, obj, tag.to_canonical_string(true).as_bytes(), 1)?;
         }
     }
     ensure!(outputs.is_empty(), "unexpected output object");
@@ -188,6 +193,7 @@ pub fn decode_with_rules(
     );
     let mut receipts = Vec::new();
     let mut coins = Changes::new();
+    let mut unlisted = BTreeMap::new();
     let mut executions = Vec::new();
     for (expected, tx) in cp.checkpoint_contents.iter().zip(&cp.transactions) {
         ensure!(
@@ -200,7 +206,7 @@ pub fn decode_with_rules(
             "event digest mismatch"
         );
         receipts.extend(
-            changes(tx, &mut coins, rules, expected_height)
+            changes(tx, &mut coins, &mut unlisted, rules, expected_height)
                 .with_context(|| format!("transaction {}", expected.transaction))?,
         );
         let data = tx.transaction.data().transaction_data();
@@ -211,6 +217,21 @@ pub fn decode_with_rules(
             .map(|(id, v)| (id.into_bytes(), v.value()))
             .collect::<Vec<_>>();
         consumed.sort_unstable();
+        let owners = if data.sender() != data.gas_owner() {
+            tx.effects
+                .mutated()
+                .into_iter()
+                .filter_map(|((id, _, _), owner)| {
+                    if let Owner::AddressOwner(addr) = owner {
+                        Some((id.into_bytes(), addr.to_inner()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         executions.push(custody_store::mango::Execution {
             hash: expected.transaction.into_inner(),
             sender: data.sender().to_inner(),
@@ -218,10 +239,20 @@ pub fn decode_with_rules(
             success: tx.effects.status().is_ok(),
             net_gas: tx.effects.gas_cost_summary().net_gas_usage(),
             consumed,
+            owners,
         });
     }
     Ok((
         FinalizedBlock {
+            openings: unlisted
+                .into_iter()
+                .filter(|(_, d)| *d != 0)
+                .map(|((owner, asset), d)| custody_store::OpeningDelta {
+                    address: owner.to_inner().to_vec(),
+                    asset,
+                    delta: d.to_string(),
+                })
+                .collect(),
             network: MangoTestnet,
             height: expected_height.try_into()?,
             digest: digest.into_inner(),

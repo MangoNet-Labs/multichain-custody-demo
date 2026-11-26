@@ -7,6 +7,8 @@ x-env: &env
   DATABASE_URL: postgresql://custody:${CUSTODY_DB_PASSWORD:?Run sh scripts/configure.sh first}@db:5432/custody
 x-after-migration: &after-migration
   migrate: {condition: service_completed_successfully}
+x-after-assets: &after-assets
+  assets: {condition: service_completed_successfully}
 
 services:
   db:
@@ -35,6 +37,15 @@ services:
     environment:
       CUSTODY_UNLOCK_FILE: /data/credentials/private/unlock.key
     volumes: [unlock:/data/credentials]
+  assets:
+    image: multichain-custody-signing:local
+    pull_policy: never
+    environment: *env
+    depends_on: *after-migration
+    command: [sh, -ec, "evm-reader --init-assets && exec mango-worker --init-assets"]
+    volumes:
+      - &bsc-assets ${BSC_TOKEN_CONFIG:-./config/bsc-testnet-tokens.json}:/app/config/bsc-testnet-tokens.json:ro
+      - &mango-assets ${MANGO_COIN_CONFIG:-./config/mango-testnet-coins.json}:/app/config/mango-testnet-coins.json:ro
   web:
     <<: *app
     build: {context: ., target: app}
@@ -47,33 +58,35 @@ services:
   bsc:
     <<: *app
     command: [evm-reader, --follow]
-    depends_on: *after-migration
+    depends_on: *after-assets
     environment:
       <<: *env
       BSC_TESTNET_RPC_URL: ${BSC_TESTNET_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}
       BSC_FETCH_CONCURRENCY: ${BSC_FETCH_CONCURRENCY:-4}
+      BSC_START_HEIGHT: ${BSC_START_HEIGHT:-}
       BSC_READY_CAPACITY: ${BSC_READY_CAPACITY:-8}
     volumes:
-      - ${BSC_TOKEN_CONFIG:-./config/bsc-testnet-tokens.json}:/app/config/bsc-testnet-tokens.json:ro
+      - *bsc-assets
     restart: unless-stopped
   mango:
     build: {context: ., target: mango}
     image: multichain-custody-mango:local
-    depends_on: *after-migration
+    depends_on: *after-assets
     environment:
       <<: *env
       MANGO_REST_URL: ${MANGO_REST_URL:-https://fullnode.testnet2.mangonetwork.io/rest}
       MANGO_FETCH_CONCURRENCY: ${MANGO_FETCH_CONCURRENCY:-2}
+      MANGO_START_HEIGHT: ${MANGO_START_HEIGHT:-}
       MANGO_INFLIGHT_MIB: ${MANGO_INFLIGHT_MIB:-64}
       MANGO_READY_CAPACITY: ${MANGO_READY_CAPACITY:-8}
     volumes:
-      - ${MANGO_COIN_CONFIG:-./config/mango-testnet-coins.json}:/app/config/mango-testnet-coins.json:ro
+      - *mango-assets
     restart: unless-stopped
   signer:
     build: {context: ., target: signing}
     image: multichain-custody-signing:local
     command: [custody-signer, serve]
-    depends_on: *after-migration
+    depends_on: *after-assets
     environment:
       <<: *env
       CUSTODY_KEYSTORE: /data/keystore/private
@@ -84,13 +97,16 @@ services:
       MANGO_PAYOUT_GAS_BUDGET: ${MANGO_PAYOUT_GAS_BUDGET:-10000000}
     volumes:
       - keystore:/data/keystore
+      - *bsc-assets
+      - *mango-assets
       - unlock:/data/credentials:ro
       - ${CUSTODY_SWEEP_CONFIG:-./config/sweep.example.toml}:/app/config/sweep.example.toml:ro
     restart: unless-stopped
   broadcast:
     <<: *app
     command: [evm-reader, --broadcast]
-    depends_on: *after-migration
+    volumes: [*bsc-assets]
+    depends_on: *after-assets
     environment:
       <<: *env
       BSC_TESTNET_RPC_URL: ${BSC_TESTNET_RPC_URL:-https://bsc-testnet-rpc.publicnode.com}
@@ -99,7 +115,8 @@ services:
     image: multichain-custody-mango:local
     pull_policy: never
     command: [mango-worker, --broadcast]
-    depends_on: *after-migration
+    volumes: [*mango-assets]
+    depends_on: *after-assets
     environment:
       <<: *env
       MANGO_RPC_URL: ${MANGO_RPC_URL:-https://fullnode.testnet2.mangonetwork.io}

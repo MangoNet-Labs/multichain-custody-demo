@@ -23,7 +23,7 @@ for user in alice bob; do
 done
 wait_sql "SELECT count(*)=8 FROM wallets WHERE role IN ('hot','gas') OR owner_id IN ('alice','bob')" 'platform and user wallets'
 if [ "${1:-}" = '--restart' ]; then
-    [ "$(sql "SELECT NOT EXISTS(SELECT 1 FROM withdrawals WHERE status IN ('queued','signed','submitted','review')) AND NOT EXISTS(SELECT 1 FROM sweep_orders WHERE status IN ('signed','submitted','review')) AND NOT EXISTS(SELECT 1 FROM sweep_checks WHERE next_check IS NOT NULL)")" = t ] || {
+    [ "$(sql "SELECT NOT EXISTS(SELECT 1 FROM withdrawals WHERE status NOT IN ('completed','failed')) AND NOT EXISTS(SELECT 1 FROM sweep_orders WHERE status IN ('signed','submitted','review')) AND NOT EXISTS(SELECT 1 FROM sweep_checks WHERE next_check IS NOT NULL)")" = t ] || {
         printf 'Finish pending payments and sweep checks before running the restart check.\n' >&2; exit 1;
     }
     wallet_sql="SELECT a.network,a.slot,encode(w.address,'hex') FROM wallet_allocations a JOIN wallets w ON w.key_ref=a.id::text ORDER BY a.network,a.slot"

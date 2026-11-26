@@ -118,6 +118,7 @@ async fn scanner_health_distinguishes_finality_backlog_stale_samples_and_recover
     .await?;
     note_scan_head(&db, BscTestnet, 13, 10).await;
     let block = |h: u8| FinalizedBlock {
+        openings: vec![],
         network: BscTestnet,
         height: h.into(),
         parent: [h - 1; 32],
@@ -258,6 +259,7 @@ async fn accounts_addresses_evidence_and_idempotent_withdrawal(db: PgPool) -> Re
     apply(
         &db,
         &FinalizedBlock {
+            openings: vec![],
             network: BscTestnet,
             height: 11,
             parent: [10; 32],
@@ -399,6 +401,24 @@ async fn withdraw_native_mango_uses_separate_ledger_and_full_address(db: PgPool)
     )
     .await?;
     assert!(page.contains("Mango Testnet") && page.contains("1.2 MGO"));
+    sqlx::query("INSERT INTO wallets(network,address,role,key_ref) VALUES('mango-testnet',$1,'hot','fixture-hot')")
+        .bind([3u8;32].as_slice()).execute(&db).await?;
+    sqlx::query("INSERT INTO mango_payouts(merge_for,sender,digest,tx_bytes,signature,budget) SELECT id,$1,$2,$3,$4,1000 FROM withdrawals")
+        .bind([3u8;32].as_slice()).bind([5u8;32].as_slice()).bind([1u8].as_slice()).bind([0u8;97].as_slice()).execute(&db).await?;
+    sqlx::query("UPDATE withdrawals SET status='consolidating'")
+        .execute(&db)
+        .await?;
+    let (status, page) = request(
+        &router,
+        "/activity/alice?kind=withdrawals",
+        None,
+        HOST,
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("consolidating") && page.contains("Latest hot-wallet consolidation"));
+    assert!(!page.contains("Signed transaction") && !page.contains("Finalized transaction"));
     Ok(())
 }
 

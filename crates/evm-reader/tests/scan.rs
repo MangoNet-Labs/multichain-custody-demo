@@ -19,6 +19,32 @@ fn config(contracts: &[u8]) -> Value {
         .collect();
     json!({"network":"bsc-testnet","tokens":tokens})
 }
+
+#[test]
+fn unlisted_erc20_has_signed_deltas_but_neither_nft_nor_ledger_credit() {
+    let block = serde_json::from_value(
+        json!({"number":"0x7","hash":hash(99),"parentHash":hash(98),"transactions":[tx(0)]}),
+    )
+    .unwrap();
+    let mut nft = transfer(9, 0, 1);
+    nft["topics"].as_array_mut().unwrap().push(json!(hash(2)));
+    nft["data"] = json!("0x");
+    let receipts: Vec<_> =
+        serde_json::from_value(json!([receipt(0, vec![transfer(8, 0, 0), nft])])).unwrap();
+    let mut observations = vec![];
+    let (rows, _) = evm_reader::scan_observed(
+        &block,
+        &receipts,
+        &Default::default(),
+        |_| true,
+        &mut observations,
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1); // native transfer only
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].delta, format!("-{}", U256::MAX));
+    assert_eq!(observations[1].asset, addr(8).to_vec());
+}
 fn tx(i: u8) -> Value {
     json!({"hash":hash(i),"transactionIndex":hex(i),"blockHash":hash(99),"blockNumber":"0x7",
         "from":addr(1),"to":addr(2),"value":"0x2a","nonce":hex(i)})

@@ -10,6 +10,50 @@ use std::collections::HashSet;
 
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "run sh scripts/test-postgres.sh"]
+async fn bsc_sweep_rules_wait_for_the_scanners_first_allowlist(db: PgPool) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let secret = tmp.path().join("secrets/unlock");
+    create_unlock_file(&secret)?;
+    let signer = Signer::open(db.clone(), &tmp.path().join("keys"), &secret).await?;
+    let contract = alloy_primitives::address!("edb22908ca8b42f0bbe0ec337f5f21948c83f046");
+    let config = include_str!("../../../config/sweep.example.toml");
+    initialize(
+        &db,
+        BscTestnet,
+        Cursor {
+            height: 10,
+            digest: [10; 32],
+        },
+    )
+    .await?;
+
+    // A visible cursor (and even a native-only sweep rule) must not signal readiness.
+    let native_only = "[[sweep]]\nnetwork='bsc-testnet'\nasset='native'\nmin_sweep_amount='1'";
+    for rules in [native_only, config] {
+        let error = signer
+            .configure_sweeps(BscTestnet, rules)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("has not activated"), "{error}");
+    }
+    let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM assets WHERE network='bsc-testnet' AND asset<>''), (SELECT count(*) FROM sweep_rules)")
+        .fetch_one(&db).await?;
+    assert_eq!(counts, (0, 0));
+
+    // A fresh installation may choose metadata different from the example.
+    let tokens = vec![(contract.into_array(), "CUSTOM".to_owned(), 6)];
+    let rules = custody_store::configure_tokens(&db, tokens.clone()).await?;
+    signer.configure_sweeps(BscTestnet, config).await?;
+    assert_eq!(custody_store::configure_tokens(&db, tokens).await?, rules);
+    signer.configure_sweeps(BscTestnet, config).await?;
+    let row: (String, i16, String) = sqlx::query_as("SELECT a.symbol,a.decimals,s.minimum::text FROM assets a JOIN sweep_rules s USING(network,asset) WHERE a.network='bsc-testnet' AND a.asset=$1")
+        .bind(contract.as_slice()).fetch_one(&db).await?;
+    assert_eq!(row, ("CUSTOM".into(), 6, "1000000".into()));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "run sh scripts/test-postgres.sh"]
 async fn wallet_lifecycle(db: PgPool) -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let vault = tmp.path().join("keystore");

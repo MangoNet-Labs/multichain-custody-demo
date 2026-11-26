@@ -2,12 +2,12 @@ use alloy_primitives::{Address, B256, U64};
 use anyhow::{ensure, Context, Result};
 use custody_core::pipeline::ordered_range;
 use evm_reader::rpc::BscRpc;
-use evm_reader::{allowlist, scan_matching, Block, Incoming, Receipt, Token};
+use evm_reader::{configured_tokens, scan_observed, Block, Incoming, Receipt, Token};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -27,7 +27,30 @@ struct Reader {
     watched: Option<HashSet<Address>>,
 }
 
+async fn historical_tokens(
+    db: &custody_store::PgPool,
+    height: u64,
+) -> Result<HashMap<Address, Token>> {
+    let rows: Vec<custody_store::registry::Asset> = sqlx::query_as(
+        "SELECT asset,symbol,decimals FROM assets WHERE network='bsc-testnet' AND asset<>'' AND enabled_from<=$1")
+        .bind(i64::try_from(height)?).fetch_all(db).await?;
+    rows.into_iter()
+        .map(|(id, symbol, decimals)| {
+            let contract = Address::try_from(id.as_slice())?;
+            Ok((
+                contract,
+                Token {
+                    contract,
+                    symbol,
+                    decimals: decimals.try_into()?,
+                },
+            ))
+        })
+        .collect()
+}
+
 struct Observed {
+    openings: Vec<custody_store::OpeningDelta>,
     hash: B256,
     parent: B256,
     transactions: usize,
@@ -59,10 +82,16 @@ impl Reader {
 
     fn decode(&self, n: U64, block: Block, receipts: Vec<Receipt>) -> Result<Observed> {
         ensure!(block.number == n, "unexpected block number");
-        let (incoming, executions) = scan_matching(&block, &receipts, &self.tokens, |to| {
-            self.watched.as_ref().is_none_or(|set| set.contains(to))
-        })?;
+        let mut openings = Vec::new();
+        let (incoming, executions) = scan_observed(
+            &block,
+            &receipts,
+            &self.tokens,
+            |to| self.watched.as_ref().is_none_or(|set| set.contains(to)),
+            &mut openings,
+        )?;
         Ok(Observed {
+            openings,
             hash: block.hash,
             parent: block.parent_hash,
             transactions: block.transactions.len(),
@@ -88,6 +117,11 @@ async fn main() -> Result<()> {
     let concurrency = setting("BSC_FETCH_CONCURRENCY", 4, 16)?;
     let ready = setting("BSC_READY_CAPACITY", 8, 128)?;
     let args: Vec<_> = env::args().skip(1).collect();
+    if args == ["--init-assets"] {
+        let db = custody_store::PgPool::connect(&env::var("DATABASE_URL")?).await?;
+        custody_store::MIGRATIONS.run(&db).await?;
+        return evm_reader::check_assets(&db).await;
+    }
     if args == ["--reconcile"] {
         let db = custody_store::PgPool::connect(&env::var("DATABASE_URL")?).await?;
         return reconcile::run(&db, BscRpc::from_env()?).await;
@@ -98,6 +132,7 @@ async fn main() -> Result<()> {
         )
         .await?;
         custody_store::MIGRATIONS.run(&db).await?;
+        evm_reader::check_assets(&db).await?;
         let node = BscRpc::from_env()?;
         loop {
             let sent = evm_reader::broadcast::send_ready(&db, &node).await;
@@ -125,9 +160,16 @@ async fn main() -> Result<()> {
         ensure!(!addr.is_zero(), "zero address is not a deposit address");
         watched.insert(addr);
     }
-    let path =
-        env::var("BSC_TOKEN_ALLOWLIST").unwrap_or_else(|_| "config/bsc-testnet-tokens.json".into());
-    let tokens = allowlist(&fs::read(&path).with_context(|| format!("reading {path}"))?)?;
+    let replay = if backfill {
+        let db = custody_store::PgPool::connect(&env::var("DATABASE_URL")?).await?;
+        Some((db, args[1].parse::<u64>()?))
+    } else {
+        None
+    };
+    let tokens = match &replay {
+        Some((db, h)) => historical_tokens(db, *h).await?,
+        None => configured_tokens()?,
+    };
     let node = BscRpc::from_env()?;
     node.verify()?;
     let source = Arc::new(Reader {
@@ -138,12 +180,10 @@ async fn main() -> Result<()> {
     if persist {
         return persistent::run(source, concurrency, ready, args[0] == "--follow").await;
     }
-    if backfill {
-        let h = args[1].parse()?;
+    if let Some((db, h)) = replay {
         let mut observed = source.fetch(h).await?;
         let executions = std::mem::take(&mut observed.executions);
         let b = observed.into_finalized(h)?;
-        let db = custody_store::PgPool::connect(&env::var("DATABASE_URL")?).await?;
         println!(
             "platform funding recorded={}",
             custody_store::funding::backfill(&db, &b, Some(&executions), None).await?
